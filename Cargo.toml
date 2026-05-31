@@ -1,0 +1,27 @@
+[package]
+name = "logviewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI
+eframe = "0.34"
+egui = "0.34"
+
+# File watching (tail -f)
+notify = "8"
+
+# Regex — PCRE-compatible
+fancy-regex = "0.14"
+
+# Memory-mapped file streaming
+memmap2 = "0.9"
+
+# .tar.gz support
+flate2 = "1"
+tar = "0.4"
+
+# Clipboard (Ctrl+C copy)
+arboard = "3"
+
+# Native file o
