@@ -88,6 +88,8 @@ pub fn process_keybinds(
 
         // --- /: search mode ---
         // Focus the search input when terminal mode is active and the user hits '/'.
+        // The GUI search box is always visible, but in terminal mode / should
+        // jump keyboard focus into it so the user can type the search pattern.
         if input.key_pressed(egui::Key::Slash) {
             *search_focus_requested = true;
         }

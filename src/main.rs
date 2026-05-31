@@ -99,6 +99,15 @@ impl eframe::App for LogViewerApp {
     //   frame — gives access to the eframe window itself (resize, close, set title, etc.).
     //           Prefixed with _ to suppress the "unused variable" compiler warning.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Choose the app-wide theme based on mode.
+        // GUI mode uses a light theme with dark text and a white background.
+        // Terminal mode uses a dark theme with light text and a black background.
+        ui.style_mut().visuals = if self.keybind_state.enabled {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+
         // Render a large bold heading at the top of the window.
         // This consumes vertical space and moves the cursor down for subsequent widgets.
         // --- Top bar ---
@@ -107,7 +116,12 @@ impl eframe::App for LogViewerApp {
 
             ui.add_space(16.0);
             ui.label("Search:");
-            let response = ui.text_edit_singleline(&mut self.search_query);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .desired_width(400.0)
+                    .min_size(egui::vec2(400.0, 36.0))
+                    .hint_text("type search and press Enter"),
+            );
 
             // Spacer pushes the toggle button to the right side of the heading bar.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -129,7 +143,11 @@ impl eframe::App for LogViewerApp {
         });
 
         let search_has_focus = search_response.response.has_focus();
+        let search_lost_focus = search_response.response.lost_focus();
+
         if self.search_focus_requested {
+            // Slash was pressed in terminal mode. Request focus for the search box
+            // on the next frame so the user can start typing immediately.
             search_response.response.request_focus();
             self.search_focus_requested = false;
         }
@@ -154,6 +172,18 @@ impl eframe::App for LogViewerApp {
                 .collect()
         };
         let total_rows = filtered_lines.len();
+
+        if search_lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // User submitted the search query by pressing Enter.
+            // If the search found matches, move focus away from the search box so
+            // terminal navigation keys work again. If there are no matches, keep
+            // the search box focused so the user can continue editing.
+            if total_rows == 0 {
+                search_response.response.request_focus();
+            } else {
+                search_response.response.surrender_focus();
+            }
+        }
 
         // Process keybinds for this frame BEFORE rendering the ScrollArea.
         // This ensures scroll_offset is populated before the ScrollArea reads it,
