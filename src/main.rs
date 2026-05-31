@@ -191,12 +191,13 @@ impl eframe::App for LogViewerApp {
             // Total number of rows in the file. show_rows() needs this to:
             //   1. correctly size the scrollbar thumb relative to total content
             //   2. calculate which row indices are visible at the current scroll position
-            let filtered_lines: Vec<&String> = if self.search_query.is_empty() {
-                self.lines.iter().collect()
+            let filtered_lines: Vec<(usize, &String)> = if self.search_query.is_empty() {
+                self.lines.iter().enumerate().collect()
             } else {
                 self.lines
                     .iter()
-                    .filter(|line| line.contains(&self.search_query))
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(&self.search_query))
                     .collect()
             };
             let total_rows = filtered_lines.len();
@@ -249,8 +250,16 @@ impl eframe::App for LogViewerApp {
             }
 
             scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                for line in &filtered_lines[row_range] {
-                    ui.monospace(*line);
+                for &(index, line) in &filtered_lines[row_range] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(72.0, row_height),
+                            egui::Label::new(
+                                egui::RichText::new(format!("{:>6}", index + 1)).monospace(),
+                            ),
+                        );
+                        ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
+                    });
                 }
             });
         });
