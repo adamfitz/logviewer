@@ -1,3 +1,7 @@
+// Declare the keybinds module — tells the Rust compiler to look for
+// src/keybinds.rs and compile it as part of this crate.
+mod keybinds;
+
 // Import the egui immediate-mode GUI library via eframe's re-export.
 // eframe is the application framework (handles the window, event loop, OS integration).
 // egui is the GUI library itself (widgets, layout, rendering).
@@ -7,6 +11,9 @@ use eframe::egui;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+
+// bring KeybindState into scope so we can use it without the module prefix.
+use keybinds::KeybindState;
 
 // The application state struct. In egui's immediate-mode model, this struct is
 // the single source of truth — everything the UI needs to render a frame lives here.
@@ -21,6 +28,23 @@ struct LogViewerApp {
     // on every resize. With Vec<String> + show_rows(), only the ~30 visible lines
     // are laid out per frame regardless of file size, eliminating the maximise freeze.
     lines: Vec<String>,
+    //
+    // Owned instance of the keybind runtime state (enabled/disabled flag etc.).
+    // Stored here so it persists across frames — egui re-calls ui() every frame
+    // but the struct itself lives for the lifetime of the application.
+    keybind_state: KeybindState,
+
+    // The current search query entered by the user.
+    // We render this as a visible text box so typed characters are shown.
+    search_query: String,
+
+    // When terminal search is requested with '/', focus the search field.
+    search_focus_requested: bool,
+
+    // The scroll offset to apply this frame, in pixels.
+    // process_keybinds() writes into this each frame; the ScrollArea reads it.
+    // Reset to 0.0 each frame after being consumed so movements don't accumulate.
+    scroll_offset: f32,
 }
 
 impl LogViewerApp {
@@ -49,9 +73,15 @@ impl LogViewerApp {
         // .collect() gathers the iterator into our Vec<String>.
         let lines = content.lines().map(|l| l.to_string()).collect();
 
-        // Rust's struct initialisation shorthand — field name matches variable name,
-        // so `lines: lines` can be written as just `lines`.
-        Self { lines }
+        // Rust's struct initialization shorthand works when the field name matches
+        // the variable name. Here we also provide the remaining fields explicitly.
+        Self {
+            lines,
+            keybind_state: KeybindState::new(),
+            search_query: String::new(),
+            search_focus_requested: false,
+            scroll_offset: 0.0,
+        }
     }
 }
 
@@ -71,7 +101,38 @@ impl eframe::App for LogViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Render a large bold heading at the top of the window.
         // This consumes vertical space and moves the cursor down for subsequent widgets.
-        ui.heading("Log Viewer");
+        // --- Top bar ---
+        let search_response = ui.horizontal(|ui| {
+            ui.heading("Log File Viewer");
+
+            ui.add_space(16.0);
+            ui.label("Search:");
+            let response = ui.text_edit_singleline(&mut self.search_query);
+
+            // Spacer pushes the toggle button to the right side of the heading bar.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Toggle button — label changes to reflect current mode so the
+                // user always knows which mode they are in at a glance.
+                let label = if self.keybind_state.enabled {
+                    "Mode: Terminal (vim/less)"
+                } else {
+                    "Mode: GUI"
+                };
+                // ui.button() returns a Response; .clicked() is true for exactly
+                // one frame when the button is pressed, so this is a clean toggle.
+                if ui.button(label).clicked() {
+                    self.keybind_state.enabled = !self.keybind_state.enabled;
+                }
+            });
+
+            response
+        });
+
+        let search_has_focus = search_response.response.has_focus();
+        if self.search_focus_requested {
+            search_response.response.request_focus();
+            self.search_focus_requested = false;
+        }
 
         // Measure the pixel height of a single monospace text row at the current
         // UI scale factor. This must match the text style used inside show_rows()
@@ -84,46 +145,56 @@ impl eframe::App for LogViewerApp {
         // Total number of rows in the file. show_rows() needs this to:
         //   1. correctly size the scrollbar thumb relative to total content
         //   2. calculate which row indices are visible at the current scroll position
-        let total_rows = self.lines.len();
+        let filtered_lines: Vec<&String> = if self.search_query.is_empty() {
+            self.lines.iter().collect()
+        } else {
+            self.lines
+                .iter()
+                .filter(|line| line.contains(&self.search_query))
+                .collect()
+        };
+        let total_rows = filtered_lines.len();
 
-        // ScrollArea makes its contents scrollable when they exceed the available space.
-        // ::vertical() means only vertical scrolling is enabled (no horizontal scroll).
-        egui::ScrollArea::vertical()
-            // Prevent the scroll area from shrinking smaller than the available space.
-            // Without this, the scroll area can collapse when content is short,
-            // leaving an unstyled gap at the bottom of the window.
-            .auto_shrink(false)
-            // show_rows() is the virtualised/lazy alternative to show().
-            //
-            // Instead of rendering all rows every frame, it:
-            //   1. Calculates which row indices fall within the visible viewport
-            //      based on the current scroll offset and row_height
-            //   2. Inserts invisible spacer widgets above and below the visible range
-            //      to maintain correct scroll position and scrollbar thumb size
-            //   3. Only calls our closure for the visible rows (~20-40 at typical sizes)
-            //
-            // This means resizing or maximising the window only ever lays out the
-            // rows currently visible — not the entire file — eliminating the freeze.
-            //
-            // Arguments:
-            //   ui         — the parent UI context
-            //   row_height — pixel height of each row (must match rendered text style)
-            //   total_rows — total row count (for scrollbar and spacer calculations)
-            //   closure    — called with (ui, row_range) where row_range is the
-            //                Range<usize> of currently visible row indices
-            .show_rows(ui, row_height, total_rows, |ui, row_range| {
-                // row_range is a Range<usize> — e.g. 42..71 — representing only
-                // the lines currently visible in the viewport. We slice our Vec
-                // directly with this range; Rust's range slicing is zero-cost.
-                for line in &self.lines[row_range] {
-                    // Render each visible line as monospaced text.
-                    // Monospace is important for log files — it preserves alignment
-                    // of columns, stack traces, timestamps, and other structured output.
-                    // Each call to monospace() renders exactly one line and advances
-                    // the layout cursor down by row_height pixels.
-                    ui.monospace(line);
-                }
-            });
+        // Process keybinds for this frame BEFORE rendering the ScrollArea.
+        // This ensures scroll_offset is populated before the ScrollArea reads it,
+        // so movements take effect on the same frame they are pressed (no 1-frame lag).
+        //
+        // process_keybinds() returns true if q was pressed and we should quit.
+        let should_quit = keybinds::process_keybinds(
+            ui.ctx(),
+            &mut self.keybind_state,
+            &mut self.scroll_offset,
+            total_rows,
+            row_height,
+            search_has_focus,
+            &mut self.search_focus_requested,
+        );
+
+        if should_quit {
+            // eframe 0.34 does not expose a close() method on Frame, so we
+            // exit immediately when q is pressed in terminal keybind mode.
+            std::process::exit(0);
+        }
+
+        // Apply the scroll delta computed by process_keybinds() this frame.
+        // vertical_scroll_offset() sets an absolute position; we add the delta
+        // to whatever the current position is to get relative movement.
+        // After consuming it, reset to 0.0 so the view does not keep scrolling
+        // on frames where no key is pressed.
+        let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
+        if self.scroll_offset != 0.0 {
+            // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
+            // is simpler and works correctly for all movements including page up/down.
+            scroll_area = scroll_area.vertical_scroll_offset(self.scroll_offset);
+            // Reset after consuming so movement stops when the key is released.
+            self.scroll_offset = 0.0;
+        }
+
+        scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+            for line in &filtered_lines[row_range] {
+                ui.monospace(*line);
+            }
+        });
     }
 }
 
