@@ -100,130 +100,159 @@ impl eframe::App for LogViewerApp {
     //           Prefixed with _ to suppress the "unused variable" compiler warning.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Choose the app-wide theme based on mode.
-        // GUI mode uses a light theme with dark text and a white background.
-        // Terminal mode uses a dark theme with light text and a black background.
-        ui.style_mut().visuals = if self.keybind_state.enabled {
+        // GUI mode uses a white background and black text.
+        // Terminal mode uses a black background and white text.
+        let mut visuals = if self.keybind_state.enabled {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
         };
 
-        // Render a large bold heading at the top of the window.
-        // This consumes vertical space and moves the cursor down for subsequent widgets.
-        // --- Top bar ---
-        let search_response = ui.horizontal(|ui| {
-            ui.heading("Log File Viewer");
+        if self.keybind_state.enabled {
+            visuals.extreme_bg_color = egui::Color32::BLACK;
+            visuals.panel_fill = egui::Color32::BLACK;
+            visuals.window_fill = egui::Color32::BLACK;
+            visuals.faint_bg_color = egui::Color32::from_gray(20);
+            visuals.override_text_color = Some(egui::Color32::WHITE);
+        } else {
+            visuals.extreme_bg_color = egui::Color32::WHITE;
+            visuals.panel_fill = egui::Color32::WHITE;
+            visuals.window_fill = egui::Color32::WHITE;
+            visuals.faint_bg_color = egui::Color32::from_gray(240);
+            visuals.override_text_color = Some(egui::Color32::BLACK);
+        }
 
-            ui.add_space(16.0);
-            ui.label("Search:");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .desired_width(400.0)
-                    .min_size(egui::vec2(400.0, 36.0))
-                    .hint_text("type search and press Enter"),
-            );
+        ui.ctx().set_visuals(visuals.clone());
+        ui.style_mut().visuals = visuals;
 
-            // Spacer pushes the toggle button to the right side of the heading bar.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Toggle button — label changes to reflect current mode so the
-                // user always knows which mode they are in at a glance.
-                let label = if self.keybind_state.enabled {
-                    "Mode: Terminal (vim/less)"
-                } else {
-                    "Mode: GUI"
-                };
-                // ui.button() returns a Response; .clicked() is true for exactly
-                // one frame when the button is pressed, so this is a clean toggle.
-                if ui.button(label).clicked() {
-                    self.keybind_state.enabled = !self.keybind_state.enabled;
-                }
+        // Render the mode-specific background for the entire app.
+        // GUI mode uses an all-white background; terminal mode uses all-black.
+        let frame_fill = if self.keybind_state.enabled {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+        let frame = egui::Frame::new().fill(frame_fill);
+
+        frame.show(ui, |ui| {
+            // Render a large bold heading at the top of the window.
+            // This consumes vertical space and moves the cursor down for subsequent widgets.
+            // --- Top bar ---
+            let search_response = ui.horizontal(|ui| {
+                ui.heading("Log File Viewer");
+
+                ui.add_space(16.0);
+                ui.label("Search:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .desired_width(400.0)
+                        .min_size(egui::vec2(400.0, 36.0))
+                        .hint_text("type search and press Enter"),
+                );
+
+                // Spacer pushes the toggle button to the right side of the heading bar.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Toggle button — label changes to reflect current mode so the
+                    // user always knows which mode they are in at a glance.
+                    let label = if self.keybind_state.enabled {
+                        "Mode: Terminal (vim/less)"
+                    } else {
+                        "Mode: GUI"
+                    };
+                    // ui.button() returns a Response; .clicked() is true for exactly
+                    // one frame when the button is pressed, so this is a clean toggle.
+                    if ui.button(label).clicked() {
+                        self.keybind_state.enabled = !self.keybind_state.enabled;
+                    }
+                });
+
+                response
             });
 
-            response
-        });
+            let search_text_response = search_response.inner;
+            let search_has_focus = search_text_response.has_focus();
+            let search_lost_focus = search_text_response.lost_focus();
 
-        let search_has_focus = search_response.response.has_focus();
-        let search_lost_focus = search_response.response.lost_focus();
+            if self.search_focus_requested {
+                // Slash was pressed in terminal mode. Request focus for the search box
+                // on the next frame so the user can start typing immediately.
+                search_text_response.request_focus();
+                self.search_focus_requested = false;
+            }
 
-        if self.search_focus_requested {
-            // Slash was pressed in terminal mode. Request focus for the search box
-            // on the next frame so the user can start typing immediately.
-            search_response.response.request_focus();
-            self.search_focus_requested = false;
-        }
+            // Measure the pixel height of a single monospace text row at the current
+            // UI scale factor. This must match the text style used inside show_rows()
+            // below — if they differ, row positions will be miscalculated and lines
+            // will overlap or have gaps between them.
+            // text_style_height() accounts for the font size AND the current display
+            // scale (e.g. HiDPI/Retina), so it is always correct regardless of monitor.
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
 
-        // Measure the pixel height of a single monospace text row at the current
-        // UI scale factor. This must match the text style used inside show_rows()
-        // below — if they differ, row positions will be miscalculated and lines
-        // will overlap or have gaps between them.
-        // text_style_height() accounts for the font size AND the current display
-        // scale (e.g. HiDPI/Retina), so it is always correct regardless of monitor.
-        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-
-        // Total number of rows in the file. show_rows() needs this to:
-        //   1. correctly size the scrollbar thumb relative to total content
-        //   2. calculate which row indices are visible at the current scroll position
-        let filtered_lines: Vec<&String> = if self.search_query.is_empty() {
-            self.lines.iter().collect()
-        } else {
-            self.lines
-                .iter()
-                .filter(|line| line.contains(&self.search_query))
-                .collect()
-        };
-        let total_rows = filtered_lines.len();
-
-        if search_lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            // User submitted the search query by pressing Enter.
-            // If the search found matches, move focus away from the search box so
-            // terminal navigation keys work again. If there are no matches, keep
-            // the search box focused so the user can continue editing.
-            if total_rows == 0 {
-                search_response.response.request_focus();
+            // Total number of rows in the file. show_rows() needs this to:
+            //   1. correctly size the scrollbar thumb relative to total content
+            //   2. calculate which row indices are visible at the current scroll position
+            let filtered_lines: Vec<&String> = if self.search_query.is_empty() {
+                self.lines.iter().collect()
             } else {
-                search_response.response.surrender_focus();
+                self.lines
+                    .iter()
+                    .filter(|line| line.contains(&self.search_query))
+                    .collect()
+            };
+            let total_rows = filtered_lines.len();
+
+            if search_lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // User submitted the search query by pressing Enter.
+                // If the search found matches, move focus away from the search box so
+                // terminal navigation keys work again. If there are no matches, keep
+                // the search box focused so the user can continue editing.
+                if total_rows == 0 {
+                    search_text_response.request_focus();
+                } else {
+                    search_text_response.surrender_focus();
+                }
             }
-        }
 
-        // Process keybinds for this frame BEFORE rendering the ScrollArea.
-        // This ensures scroll_offset is populated before the ScrollArea reads it,
-        // so movements take effect on the same frame they are pressed (no 1-frame lag).
-        //
-        // process_keybinds() returns true if q was pressed and we should quit.
-        let should_quit = keybinds::process_keybinds(
-            ui.ctx(),
-            &mut self.keybind_state,
-            &mut self.scroll_offset,
-            total_rows,
-            row_height,
-            search_has_focus,
-            &mut self.search_focus_requested,
-        );
+            // Process keybinds for this frame BEFORE rendering the ScrollArea.
+            // This ensures scroll_offset is populated before the ScrollArea reads it,
+            // so movements take effect on the same frame they are pressed (no 1-frame lag).
+            //
+            // process_keybinds() returns true if q was pressed and we should quit.
+            let should_quit = keybinds::process_keybinds(
+                ui.ctx(),
+                &mut self.keybind_state,
+                &mut self.scroll_offset,
+                total_rows,
+                row_height,
+                search_has_focus,
+                &mut self.search_focus_requested,
+            );
 
-        if should_quit {
-            // eframe 0.34 does not expose a close() method on Frame, so we
-            // exit immediately when q is pressed in terminal keybind mode.
-            std::process::exit(0);
-        }
-
-        // Apply the scroll delta computed by process_keybinds() this frame.
-        // vertical_scroll_offset() sets an absolute position; we add the delta
-        // to whatever the current position is to get relative movement.
-        // After consuming it, reset to 0.0 so the view does not keep scrolling
-        // on frames where no key is pressed.
-        let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
-        if self.scroll_offset != 0.0 {
-            // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
-            // is simpler and works correctly for all movements including page up/down.
-            scroll_area = scroll_area.vertical_scroll_offset(self.scroll_offset);
-            // Reset after consuming so movement stops when the key is released.
-            self.scroll_offset = 0.0;
-        }
-
-        scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-            for line in &filtered_lines[row_range] {
-                ui.monospace(*line);
+            if should_quit {
+                // eframe 0.34 does not expose a close() method on Frame, so we
+                // exit immediately when q is pressed in terminal keybind mode.
+                std::process::exit(0);
             }
+
+            // Apply the scroll delta computed by process_keybinds() this frame.
+            // vertical_scroll_offset() sets an absolute position; we add the delta
+            // to whatever the current position is to get relative movement.
+            // After consuming it, reset to 0.0 so the view does not keep scrolling
+            // on frames where no key is pressed.
+            let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
+            if self.scroll_offset != 0.0 {
+                // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
+                // is simpler and works correctly for all movements including page up/down.
+                scroll_area = scroll_area.vertical_scroll_offset(self.scroll_offset);
+                // Reset after consuming so movement stops when the key is released.
+                self.scroll_offset = 0.0;
+            }
+
+            scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+                for line in &filtered_lines[row_range] {
+                    ui.monospace(*line);
+                }
+            });
         });
     }
 }
