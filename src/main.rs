@@ -12,11 +12,15 @@ use std::path::PathBuf;
 // the single source of truth — everything the UI needs to render a frame lives here.
 // Each frame, egui calls ui() and re-draws the entire interface from this state.
 struct LogViewerApp {
-    // The full text content of the log file, loaded once at startup.
-    // Stored as a String so egui can display it as a text widget.
-    // NOTE: This is a naive implementation — it loads the entire file into memory.
-    // For large log files this will be replaced with memory-mapped byte streaming.
-    log_content: String,
+    // Log file stored as individual lines rather than one large String.
+    // This is required for virtual/lazy row rendering via show_rows() —
+    // egui needs a total row count upfront and must be able to index into
+    // individual rows. Storing as Vec<String> gives us both of those for free.
+    //
+    // Performance rationale: with one big String, egui lays out every character
+    // on every resize. With Vec<String> + show_rows(), only the ~30 visible lines
+    // are laid out per frame regardless of file size, eliminating the maximise freeze.
+    lines: Vec<String>,
 }
 
 impl LogViewerApp {
@@ -29,7 +33,7 @@ impl LogViewerApp {
         // unwrap_or_else means: if reading fails (file not found, permissions, etc.),
         // instead of panicking we gracefully store an error message as the content.
         // This way the window still opens and displays a readable error to the user.
-        let log_content = fs::read_to_string(file_path).unwrap_or_else(|err| {
+        let content = fs::read_to_string(file_path).unwrap_or_else(|err| {
             format!(
                 "Failed to open log file: {}\nError: {}",
                 file_path.display(), // .display() gives a human-readable path string
@@ -37,9 +41,17 @@ impl LogViewerApp {
             )
         });
 
+        // Split the file content into individual owned lines.
+        // .lines() is a standard iterator that splits on \n and \r\n (handles both
+        // Unix and Windows line endings), and strips the newline characters themselves.
+        // .map(|l| l.to_string()) converts each &str slice into an owned String
+        // so the lines can outlive the temporary `content` String they came from.
+        // .collect() gathers the iterator into our Vec<String>.
+        let lines = content.lines().map(|l| l.to_string()).collect();
+
         // Rust's struct initialisation shorthand — field name matches variable name,
-        // so `log_content: log_content` can be written as just `log_content`.
-        Self { log_content }
+        // so `lines: lines` can be written as just `lines`.
+        Self { lines }
     }
 }
 
@@ -61,23 +73,56 @@ impl eframe::App for LogViewerApp {
         // This consumes vertical space and moves the cursor down for subsequent widgets.
         ui.heading("Log Viewer");
 
+        // Measure the pixel height of a single monospace text row at the current
+        // UI scale factor. This must match the text style used inside show_rows()
+        // below — if they differ, row positions will be miscalculated and lines
+        // will overlap or have gaps between them.
+        // text_style_height() accounts for the font size AND the current display
+        // scale (e.g. HiDPI/Retina), so it is always correct regardless of monitor.
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+        // Total number of rows in the file. show_rows() needs this to:
+        //   1. correctly size the scrollbar thumb relative to total content
+        //   2. calculate which row indices are visible at the current scroll position
+        let total_rows = self.lines.len();
+
         // ScrollArea makes its contents scrollable when they exceed the available space.
         // ::vertical() means only vertical scrolling is enabled (no horizontal scroll).
-        //
-        // min_scrolled_height() sets the minimum height of the scrollable region.
-        // ui.available_height() returns however much vertical space remains in the window
-        // after the heading above — this makes the scroll area fill the rest of the window.
         egui::ScrollArea::vertical()
-            .min_scrolled_height(ui.available_height())
-            // .show() is where the ScrollArea actually renders.
-            // It takes the parent ui and a closure; the closure receives a new child ui
-            // that represents the interior of the scrollable area.
-            .show(ui, |ui| {
-                // Render the log content as monospaced (fixed-width) text.
-                // Monospace is important for log files — it preserves alignment of
-                // columns, stack traces, timestamps, and other structured output.
-                // &self.log_content passes a string slice reference — no copy is made.
-                ui.monospace(&self.log_content);
+            // Prevent the scroll area from shrinking smaller than the available space.
+            // Without this, the scroll area can collapse when content is short,
+            // leaving an unstyled gap at the bottom of the window.
+            .auto_shrink(false)
+            // show_rows() is the virtualised/lazy alternative to show().
+            //
+            // Instead of rendering all rows every frame, it:
+            //   1. Calculates which row indices fall within the visible viewport
+            //      based on the current scroll offset and row_height
+            //   2. Inserts invisible spacer widgets above and below the visible range
+            //      to maintain correct scroll position and scrollbar thumb size
+            //   3. Only calls our closure for the visible rows (~20-40 at typical sizes)
+            //
+            // This means resizing or maximising the window only ever lays out the
+            // rows currently visible — not the entire file — eliminating the freeze.
+            //
+            // Arguments:
+            //   ui         — the parent UI context
+            //   row_height — pixel height of each row (must match rendered text style)
+            //   total_rows — total row count (for scrollbar and spacer calculations)
+            //   closure    — called with (ui, row_range) where row_range is the
+            //                Range<usize> of currently visible row indices
+            .show_rows(ui, row_height, total_rows, |ui, row_range| {
+                // row_range is a Range<usize> — e.g. 42..71 — representing only
+                // the lines currently visible in the viewport. We slice our Vec
+                // directly with this range; Rust's range slicing is zero-cost.
+                for line in &self.lines[row_range] {
+                    // Render each visible line as monospaced text.
+                    // Monospace is important for log files — it preserves alignment
+                    // of columns, stack traces, timestamps, and other structured output.
+                    // Each call to monospace() renders exactly one line and advances
+                    // the layout cursor down by row_height pixels.
+                    ui.monospace(line);
+                }
             });
     }
 }
