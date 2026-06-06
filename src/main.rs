@@ -45,6 +45,9 @@ struct LogViewerApp {
     // process_keybinds() writes into this each frame; the ScrollArea reads it.
     // Reset to 0.0 each frame after being consumed so movements don't accumulate.
     scroll_offset: f32,
+
+    // Index into search_matches for the match to jump to on the next Enter press.
+    current_match: usize,
 }
 
 impl LogViewerApp {
@@ -81,6 +84,7 @@ impl LogViewerApp {
             search_query: String::new(),
             search_focus_requested: false,
             scroll_offset: 0.0,
+            current_match: 0,
         }
     }
 }
@@ -171,7 +175,6 @@ impl eframe::App for LogViewerApp {
 
             let search_text_response = search_response.inner;
             let search_has_focus = search_text_response.has_focus();
-            let search_lost_focus = search_text_response.lost_focus();
 
             if self.search_focus_requested {
                 search_text_response.request_focus();
@@ -214,16 +217,32 @@ impl eframe::App for LogViewerApp {
             };
             let total_rows = filtered_lines.len();
 
-            if search_lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                // User submitted the search query by pressing Enter.
-                // If the search found matches, move focus away from the search box so
-                // terminal navigation keys work again. If there are no matches, keep
-                // the search box focused so the user can continue editing.
-                if total_rows == 0 {
-                    search_text_response.request_focus();
-                } else {
-                    search_text_response.surrender_focus();
+            // Build all match positions for Enter-based cycling through results.
+            // Each entry is (filtered_line_index, byte_offset_of_match).
+            let mut search_matches: Vec<(usize, usize)> = Vec::new();
+            if !self.search_query.is_empty() {
+                for (fi, (_, line)) in filtered_lines.iter().enumerate() {
+                    let mut start = 0;
+                    while let Some(pos) = line[start..].find(&self.search_query) {
+                        let abs_pos = start + pos;
+                        search_matches.push((fi, abs_pos));
+                        start = abs_pos + self.search_query.len();
+                    }
                 }
+            }
+            // Clamp current_match whenever the match set changes.
+            if self.current_match >= search_matches.len() {
+                self.current_match = 0;
+            }
+
+            // Enter: advance to next search match, scroll to it, keep focus.
+            if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && search_has_focus
+                && !search_matches.is_empty()
+            {
+                let (line_idx, _) = search_matches[self.current_match];
+                self.scroll_offset = line_idx as f32 * row_height;
+                self.current_match = (self.current_match + 1) % search_matches.len();
             }
 
             // Process keybinds for this frame BEFORE rendering the ScrollArea.
@@ -261,8 +280,50 @@ impl eframe::App for LogViewerApp {
                 self.scroll_offset = 0.0;
             }
 
+            // Pre-compute text formats for search highlighting.
+            let is_terminal = self.keybind_state.enabled;
+            let monospace_font = ui
+                .style()
+                .text_styles
+                .get(&egui::TextStyle::Monospace)
+                .cloned()
+                .unwrap_or_default();
+            let (normal_color, match_bg, current_bg) = if is_terminal {
+                (
+                    egui::Color32::WHITE,
+                    egui::Color32::from_gray(55),
+                    egui::Color32::from_gray(110),
+                )
+            } else {
+                (
+                    egui::Color32::BLACK,
+                    egui::Color32::from_rgb(255, 255, 180),
+                    egui::Color32::from_rgb(255, 200, 80),
+                )
+            };
+            let normal_fmt = egui::text::TextFormat {
+                font_id: monospace_font.clone(),
+                color: normal_color,
+                ..Default::default()
+            };
+            let match_fmt = egui::text::TextFormat {
+                font_id: monospace_font.clone(),
+                color: normal_color,
+                background: match_bg,
+                ..Default::default()
+            };
+            let current_fmt = egui::text::TextFormat {
+                font_id: monospace_font,
+                color: normal_color,
+                background: current_bg,
+                ..Default::default()
+            };
+
+            let query = &self.search_query;
             scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                for &(index, line) in &filtered_lines[row_range] {
+                let range = row_range.clone();
+                for (rel_fi, &(index, line)) in filtered_lines[range].iter().enumerate() {
+                    let fi = row_range.start + rel_fi;
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2(72.0, row_height),
@@ -270,7 +331,29 @@ impl eframe::App for LogViewerApp {
                                 egui::RichText::new(format!("{:>6}", index + 1)).monospace(),
                             ),
                         );
-                        ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
+                        if query.is_empty() {
+                            ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
+                        } else {
+                            let mut job = egui::text::LayoutJob::default();
+                            let mut start = 0;
+                            while let Some(pos) = line[start..].find(query) {
+                                let abs_pos = start + pos;
+                                if abs_pos > start {
+                                    job.append(&line[start..abs_pos], 0.0, normal_fmt.clone());
+                                }
+                                let is_current = search_matches
+                                    .get(self.current_match)
+                                    .map(|&(cm_fi, cm_off)| cm_fi == fi && cm_off == abs_pos)
+                                    .unwrap_or(false);
+                                let fmt = if is_current { &current_fmt } else { &match_fmt };
+                                job.append(&line[abs_pos..abs_pos + query.len()], 0.0, fmt.clone());
+                                start = abs_pos + query.len();
+                            }
+                            if start < line.len() {
+                                job.append(&line[start..], 0.0, normal_fmt.clone());
+                            }
+                            ui.add(egui::Label::new(job).wrap());
+                        }
                     });
                 }
             });
