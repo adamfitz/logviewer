@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo run",
+      "type": "shell",
+      "command": "cargo run -- ${input:logFile}",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "logFile",
+      "type": "promptString",
+      "description": "Path to log file",
+      "default": "~/.config/kansho/kansho.log"
+    }
+  ]
+}
