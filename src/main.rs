@@ -174,10 +174,22 @@ impl eframe::App for LogViewerApp {
             let search_lost_focus = search_text_response.lost_focus();
 
             if self.search_focus_requested {
-                // Slash was pressed in terminal mode. Request focus for the search box
-                // on the next frame so the user can start typing immediately.
                 search_text_response.request_focus();
                 self.search_focus_requested = false;
+
+                // Select all existing text
+                if let Some(mut state) =
+                    egui::TextEdit::load_state(ui.ctx(), search_text_response.id)
+                {
+                    let len = self.search_query.len();
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(len),
+                        )));
+                    state.store(ui.ctx(), search_text_response.id);
+                }
             }
 
             // Measure the pixel height of a single monospace text row at the current
