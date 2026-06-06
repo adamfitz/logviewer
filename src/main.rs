@@ -291,8 +291,8 @@ impl eframe::App for LogViewerApp {
             let (normal_color, match_bg, current_bg) = if is_terminal {
                 (
                     egui::Color32::WHITE,
-                    egui::Color32::from_gray(55),
-                    egui::Color32::from_gray(110),
+                    egui::Color32::from_rgb(90, 85, 0),
+                    egui::Color32::from_rgb(160, 150, 0),
                 )
             } else {
                 (
