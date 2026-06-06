@@ -139,39 +139,72 @@ impl eframe::App for LogViewerApp {
         let frame = egui::Frame::new().fill(frame_fill);
 
         frame.show(ui, |ui| {
-            // Render a large bold heading at the top of the window.
-            // This consumes vertical space and moves the cursor down for subsequent widgets.
-            // --- Top bar ---
+            // --- Header bar ---
+            // A compact horizontal strip containing the search label, search input,
+            // and mode toggle button. All elements share a consistent height so they
+            // appear visually uniform regardless of mode.
             let search_response = ui.horizontal(|ui| {
-                ui.heading("Log File Viewer");
+                // Set a minimum row height so the label, text field, and button all
+                // occupy the same vertical space and are aligned consistently.
+                ui.set_min_height(32.0);
 
-                ui.add_space(16.0);
-                ui.label("Search:");
-                let response = ui.add(
+                // "Search:" label styled to visually match the mode button container
+                // (same frame fill, corner radius, and inner margins) but without
+                // button interactivity — it is a static label that signals the
+                // search field.  The label takes its natural width so the remaining
+                // header space can be split between the search box and the button.
+                let btn_v = &ui.visuals().widgets.inactive;
+                egui::Frame::default()
+                    .fill(btn_v.weak_bg_fill)
+                    .corner_radius(btn_v.corner_radius)
+                    .stroke(btn_v.bg_stroke)
+                    .inner_margin(egui::Margin::symmetric(12, 0))
+                    .show(ui, |ui| {
+                        ui.set_min_height(32.0);
+                        ui.label(egui::RichText::new("Search:").size(16.0));
+                    });
+
+                // Search box: use whatever space remains after the label and the
+                // mode button (180 px) so the input always stretches to fill the
+                // header without overflowing.
+                let button_width = 180.0;
+                let gap = ui.spacing().item_spacing.x;
+                let search_width = (ui.available_width() - button_width - gap * 2.0).max(100.0);
+                let response = ui.add_sized(
+                    egui::vec2(search_width, 32.0),
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .desired_width(400.0)
-                        .min_size(egui::vec2(400.0, 36.0))
-                        .hint_text("type search and press Enter"),
+                        .font(egui::FontId::monospace(18.0))
+                        .hint_text(
+                            egui::RichText::new("type search and press Enter")
+                                .font(egui::FontId::monospace(18.0)),
+                        ),
                 );
 
-                // Spacer pushes the toggle button to the right side of the heading bar.
+                // Mode toggle button positioned at the right edge via a
+                // right-to-left sub-layout so it always sits consistently
+                // at the far right of the header bar.
+                let label = if self.keybind_state.enabled {
+                    "Mode: Terminal (vim/less)"
+                } else {
+                    "Mode: GUI"
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Toggle button — label changes to reflect current mode so the
-                    // user always knows which mode they are in at a glance.
-                    let label = if self.keybind_state.enabled {
-                        "Mode: Terminal (vim/less)"
-                    } else {
-                        "Mode: GUI"
-                    };
-                    // ui.button() returns a Response; .clicked() is true for exactly
-                    // one frame when the button is pressed, so this is a clean toggle.
-                    if ui.button(label).clicked() {
+                    if ui
+                        .add_sized(
+                            egui::vec2(button_width, 32.0),
+                            egui::Button::new(egui::RichText::new(label).size(16.0)),
+                        )
+                        .clicked()
+                    {
                         self.keybind_state.enabled = !self.keybind_state.enabled;
                     }
                 });
 
                 response
             });
+
+            // Visual separator between the header bar and the log content below.
+            ui.separator();
 
             let search_text_response = search_response.inner;
             let search_has_focus = search_text_response.has_focus();
@@ -247,8 +280,7 @@ impl eframe::App for LogViewerApp {
                     // Advance to the next match (wrapping around to 0 at the end).
                     // We increment first, then scroll — this means the match we
                     // land on IS the highlighted one, not the next one in line.
-                    self.current_match =
-                        (self.current_match + 1) % search_matches.len();
+                    self.current_match = (self.current_match + 1) % search_matches.len();
                     let (line_idx, _) = search_matches[self.current_match];
                     self.scroll_offset = line_idx as f32 * row_height;
                 } else if enter && shift {
@@ -292,8 +324,7 @@ impl eframe::App for LogViewerApp {
             // we flip current_match first, then scroll, so the jumped-to match
             // gets the bright "current match" highlight.
             if next_match && !search_matches.is_empty() {
-                self.current_match =
-                    (self.current_match + 1) % search_matches.len();
+                self.current_match = (self.current_match + 1) % search_matches.len();
                 let (line_idx, _) = search_matches[self.current_match];
                 self.scroll_offset = line_idx as f32 * row_height;
             }
@@ -326,13 +357,14 @@ impl eframe::App for LogViewerApp {
             // Ctrl+Down/Ctrl+Up for similar navigation). The match we jump to is always
             // the one with the bright "current match" highlight.
             if !self.keybind_state.enabled && !search_matches.is_empty() {
-                let (down, up) = ui.input(|i| (
-                    i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl,
-                    i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl,
-                ));
+                let (down, up) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl,
+                        i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl,
+                    )
+                });
                 if down {
-                    self.current_match =
-                        (self.current_match + 1) % search_matches.len();
+                    self.current_match = (self.current_match + 1) % search_matches.len();
                     let (line_idx, _) = search_matches[self.current_match];
                     self.scroll_offset = line_idx as f32 * row_height;
                 }

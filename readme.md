@@ -18,6 +18,43 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Launched 
 - **Dark / light themes** — Terminal mode uses dark theme with black background; GUI mode uses light theme with white background
 - **Resize handling** — Window resizes correctly without crashing; row positions are recalculated per frame
 
+## Usage
+
+```
+logviewer <path/to/logfile.log>
+```
+
+### Keybinds
+
+#### GUI Mode (default)
+
+| Key | Context | Action |
+|---|---|---|
+| `Ctrl+F` | Anywhere | Focus search box |
+| `Enter` | Search focused | Next match |
+| `Shift+Enter` | Search focused | Previous match |
+| `Ctrl+Down` | Anywhere | Next match |
+| `Ctrl+Up` | Anywhere | Previous match |
+
+#### Terminal Mode (vim/less-style)
+
+Toggle on via the **"Mode: Terminal (vim/less)"** button in the top bar.
+
+| Key | Context | Action |
+|---|---|---|
+| `j` | Anywhere | Scroll down one line |
+| `k` | Anywhere | Scroll up one line |
+| `f` | Anywhere | Page down |
+| `b` | Anywhere | Page up |
+| `g` | Anywhere | Jump to top |
+| `G` (Shift+g) | Anywhere | Jump to bottom |
+| `/` | Anywhere | Focus search box |
+| `Enter` | Search focused | Next match |
+| `Shift+Enter` | Search focused | Previous match |
+| `n` | Search not focused | Next match |
+| `N` (Shift+n) | Search not focused | Previous match |
+| `q` | Anywhere | Quit |
+
 ### Planned / Not Yet Implemented
 
 | Feature | Dependencies | Notes |
