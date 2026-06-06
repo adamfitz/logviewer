@@ -266,6 +266,13 @@ impl eframe::App for LogViewerApp {
                 std::process::exit(0);
             }
 
+            // Ctrl+F in GUI mode: focus the search bar (same as / in terminal mode).
+            if !self.keybind_state.enabled
+                && ui.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.ctrl)
+            {
+                self.search_focus_requested = true;
+            }
+
             // Apply the scroll delta computed by process_keybinds() this frame.
             // vertical_scroll_offset() sets an absolute position; we add the delta
             // to whatever the current position is to get relative movement.
