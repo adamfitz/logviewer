@@ -235,14 +235,34 @@ impl eframe::App for LogViewerApp {
                 self.current_match = 0;
             }
 
-            // Enter: advance to next search match, scroll to it, keep focus.
-            if ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && search_has_focus
-                && !search_matches.is_empty()
-            {
-                let (line_idx, _) = search_matches[self.current_match];
-                self.scroll_offset = line_idx as f32 * row_height;
-                self.current_match = (self.current_match + 1) % search_matches.len();
+            // Enter / Shift+Enter: cycle forward/backward through matches.
+            // Works in both GUI and terminal modes when the search field is focused.
+            // Enter advances to the next match; Shift+Enter goes back to the previous
+            // one. The match we jump to becomes the highlighted current match
+            // (the brighter background), so the user always sees which match is active.
+            if search_has_focus && !search_matches.is_empty() {
+                let (enter, shift) =
+                    ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                if enter && !shift {
+                    // Advance to the next match (wrapping around to 0 at the end).
+                    // We increment first, then scroll — this means the match we
+                    // land on IS the highlighted one, not the next one in line.
+                    self.current_match =
+                        (self.current_match + 1) % search_matches.len();
+                    let (line_idx, _) = search_matches[self.current_match];
+                    self.scroll_offset = line_idx as f32 * row_height;
+                } else if enter && shift {
+                    // Go back to the previous match (wrapping to the end at 0).
+                    // Decrement first, then scroll — same logic as forward cycling
+                    // but in reverse so the jumped-to match is highlighted.
+                    self.current_match = if self.current_match == 0 {
+                        search_matches.len() - 1
+                    } else {
+                        self.current_match - 1
+                    };
+                    let (line_idx, _) = search_matches[self.current_match];
+                    self.scroll_offset = line_idx as f32 * row_height;
+                }
             }
 
             // Process keybinds for this frame BEFORE rendering the ScrollArea.
@@ -250,6 +270,8 @@ impl eframe::App for LogViewerApp {
             // so movements take effect on the same frame they are pressed (no 1-frame lag).
             //
             // process_keybinds() returns true if q was pressed and we should quit.
+            let mut next_match = false;
+            let mut prev_match = false;
             let should_quit = keybinds::process_keybinds(
                 ui.ctx(),
                 &mut self.keybind_state,
@@ -258,7 +280,32 @@ impl eframe::App for LogViewerApp {
                 row_height,
                 search_has_focus,
                 &mut self.search_focus_requested,
+                &mut next_match,
+                &mut prev_match,
             );
+
+            // Handle n/N from terminal-mode keybinds.
+            // These flags are set by process_keybinds() above when the user presses
+            // n (next match) or N / Shift+n (previous match) in terminal mode.
+            // They only fire when search is NOT focused (so the letters aren't typed
+            // into the search box). The logic mirrors Enter/Shift+Enter above:
+            // we flip current_match first, then scroll, so the jumped-to match
+            // gets the bright "current match" highlight.
+            if next_match && !search_matches.is_empty() {
+                self.current_match =
+                    (self.current_match + 1) % search_matches.len();
+                let (line_idx, _) = search_matches[self.current_match];
+                self.scroll_offset = line_idx as f32 * row_height;
+            }
+            if prev_match && !search_matches.is_empty() {
+                self.current_match = if self.current_match == 0 {
+                    search_matches.len() - 1
+                } else {
+                    self.current_match - 1
+                };
+                let (line_idx, _) = search_matches[self.current_match];
+                self.scroll_offset = line_idx as f32 * row_height;
+            }
 
             if should_quit {
                 // eframe 0.34 does not expose a close() method on Frame, so we
@@ -271,6 +318,33 @@ impl eframe::App for LogViewerApp {
                 && ui.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.ctrl)
             {
                 self.search_focus_requested = true;
+            }
+
+            // Ctrl+Down / Ctrl+Up in GUI mode: cycle forward/backward through matches
+            // without needing the search field to be focused. This provides a keyboard
+            // shortcut that matches common GUI convention (many editors/text fields use
+            // Ctrl+Down/Ctrl+Up for similar navigation). The match we jump to is always
+            // the one with the bright "current match" highlight.
+            if !self.keybind_state.enabled && !search_matches.is_empty() {
+                let (down, up) = ui.input(|i| (
+                    i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl,
+                    i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl,
+                ));
+                if down {
+                    self.current_match =
+                        (self.current_match + 1) % search_matches.len();
+                    let (line_idx, _) = search_matches[self.current_match];
+                    self.scroll_offset = line_idx as f32 * row_height;
+                }
+                if up {
+                    self.current_match = if self.current_match == 0 {
+                        search_matches.len() - 1
+                    } else {
+                        self.current_match - 1
+                    };
+                    let (line_idx, _) = search_matches[self.current_match];
+                    self.scroll_offset = line_idx as f32 * row_height;
+                }
             }
 
             // Apply the scroll delta computed by process_keybinds() this frame.
@@ -288,6 +362,13 @@ impl eframe::App for LogViewerApp {
             }
 
             // Pre-compute text formats for search highlighting.
+            // Three tiers of visual treatment:
+            //   1. normal_fmt  — plain text, no match
+            //   2. match_fmt   — a search match that is NOT the current one (subtle bg)
+            //   3. current_fmt — the active/current match (bright bg + high-contrast fg)
+            // The current match uses black text on a vivid gold background so it
+            // "pops" visually against the regular match highlights and is easy to
+            // spot even in large log files.
             let is_terminal = self.keybind_state.enabled;
             let monospace_font = ui
                 .style()
@@ -295,17 +376,19 @@ impl eframe::App for LogViewerApp {
                 .get(&egui::TextStyle::Monospace)
                 .cloned()
                 .unwrap_or_default();
-            let (normal_color, match_bg, current_bg) = if is_terminal {
+            let (normal_color, match_bg, current_bg, current_fg) = if is_terminal {
                 (
                     egui::Color32::WHITE,
                     egui::Color32::from_rgb(90, 85, 0),
-                    egui::Color32::from_rgb(160, 150, 0),
+                    egui::Color32::from_rgb(220, 200, 0),
+                    egui::Color32::BLACK,
                 )
             } else {
                 (
                     egui::Color32::BLACK,
                     egui::Color32::from_rgb(255, 255, 180),
-                    egui::Color32::from_rgb(255, 200, 80),
+                    egui::Color32::from_rgb(255, 180, 0),
+                    egui::Color32::BLACK,
                 )
             };
             let normal_fmt = egui::text::TextFormat {
@@ -321,7 +404,7 @@ impl eframe::App for LogViewerApp {
             };
             let current_fmt = egui::text::TextFormat {
                 font_id: monospace_font,
-                color: normal_color,
+                color: current_fg,
                 background: current_bg,
                 ..Default::default()
             };

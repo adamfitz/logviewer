@@ -49,6 +49,10 @@ impl KeybindState {
 //                  movements (j/k/f/b) into pixel scroll deltas
 //   search_focused — true when the search text field currently has keyboard focus.
 //                    In that case, we must not intercept keystrokes so the user can type.
+//   next_match_requested — set to true when the user presses n (next match).
+//                          main.rs reads this after the call and advances current_match.
+//   prev_match_requested — set to true when the user presses N/shift+n (previous match).
+//                          main.rs reads this after the call and rewinds current_match.
 //
 // Returns true if the application should quit (q was pressed), false otherwise.
 // main.rs checks this return value and calls frame.close() accordingly.
@@ -60,10 +64,13 @@ pub fn process_keybinds(
     row_height: f32,
     search_focused: bool,
     search_focus_requested: &mut bool,
+    next_match_requested: &mut bool,
+    prev_match_requested: &mut bool,
 ) -> bool {
     // If keybind mode is not enabled, do nothing and return early.
     // This is important — we must not intercept keypresses when the user
     // is typing in a search box or other text input in normal GUI mode.
+    // When search has focus, n/N should type into the search box, not navigate.
     if !state.enabled || search_focused {
         return false;
     }
@@ -127,6 +134,18 @@ pub fn process_keybinds(
             // Requesting this as a scroll offset guarantees we land at the bottom
             // after egui's clamping, regardless of actual viewport height.
             *scroll_delta = (total_rows as f32) * row_height;
+        }
+
+        // --- n: next search match ---
+        // Advances to the next search result (like n in vim/less).
+        if input.key_pressed(egui::Key::N) && !input.modifiers.shift {
+            *next_match_requested = true;
+        }
+
+        // --- N (shift+n): previous search match ---
+        // Goes back to the previous search result (like N in vim/less).
+        if input.key_pressed(egui::Key::N) && input.modifiers.shift {
+            *prev_match_requested = true;
         }
     });
 
