@@ -7,7 +7,9 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 - **GUI framework** — Cross-platform native window via `eframe` + `egui` (immediate-mode, zero runtime deps)
 - **Memory-mapped file I/O** — Files are memory-mapped (not read into `Vec<String>`); only visible lines are extracted on demand. Line offsets stored as a compact `Vec<usize>` (~8 bytes per line). No full-file allocation.
 - **Virtual scrolling** — Only visible lines are rendered per frame via `egui::ScrollArea::show_rows()`, handling large files smoothly
-- **SIMD-accelerated search** — Uses `memchr` for byte-level substring search. Search results are cached and only rebuilt when the query changes (not every frame).
+- **PCRE-compatible regex search** — Search patterns are treated as regular expressions (via `fancy-regex`). Supports lookahead/lookbehind, alternation, character classes, etc. Invalid patterns show an error message; "No matches found" shown when no lines match.
+- **Enter-to-submit search** — Typing does nothing until Enter is pressed. First Enter submits the query; subsequent Enters cycle through matches.
+- **Incremental batched search** — Searches over 100,000 lines per frame in the background so the UI stays responsive. A "Searching... XX%" progress indicator is shown while the search runs.
 - **Search match cycling** — Forward/backward navigation through matches:
   - **GUI mode:** Enter / Shift+Enter (search focused), Ctrl+Down / Ctrl+Up (anywhere)
   - **Terminal mode:** `n` / `N` (when search is not focused), Enter / Shift+Enter (search focused)
@@ -26,7 +28,6 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 
 | Feature | Dependencies | Notes |
 |---|---|---|
-| **Regex search** | `fancy-regex` | PCRE-compatible search with lookahead/lookbehind support |
 | **Reverse search** | — | `?` keybind in terminal mode for backward search |
 | **Text selection + clipboard copy** | `arboard` | Ctrl+C to copy selected text to system clipboard |
 
@@ -47,10 +48,10 @@ logviewer <path/to/logfile.log>  # open directly
 | `Ctrl+Q` | Anywhere | Quit |
 | `Ctrl+W` | Anywhere | Toggle follow (tail -f) |
 | `Ctrl+F` | Anywhere | Focus search box |
-| `Enter` | Search focused | Next match |
-| `Shift+Enter` | Search focused | Previous match |
-| `Ctrl+Down` | Anywhere | Next match |
-| `Ctrl+Up` | Anywhere | Previous match |
+| `Enter` | Search focused | Submit query / Next match |
+| `Shift+Enter` | Search focused | Submit query / Previous match |
+| `Ctrl+Down` | Anywhere | Next match (if search active) |
+| `Ctrl+Up` | Anywhere | Previous match (if search active) |
 
 #### Terminal Mode (vim/less-style)
 

@@ -10,6 +10,7 @@ use std::sync::{
     Arc,
 };
 
+use fancy_regex::Regex;
 use keybinds::KeybindState;
 use notify::{self, EventKind, RecursiveMode, Watcher};
 use rfd;
@@ -104,8 +105,11 @@ struct LogViewerApp {
     search_results: Vec<usize>,
 
     // Cached match positions for highlighting.
-    // Each entry is (result_index, byte_offset_within_line).
-    search_matches: Vec<(usize, usize)>,
+    // Each entry is (result_index, byte_offset_within_line, match_length).
+    search_matches: Vec<(usize, usize, usize)>,
+
+    // Set when regex compilation fails during rebuild_search().
+    search_error: Option<String>,
 
     // The submitted search query (Enter pressed). Only this query triggers
     // search — typing in the search box alone does nothing until Enter.
@@ -114,6 +118,15 @@ struct LogViewerApp {
     // True on the frame after search is submitted, so the scroll area
     // resets to the top of the filtered results.
     search_just_submitted: bool,
+
+    // True while a search is running (batched across frames).
+    search_running: bool,
+
+    // Number of lines processed so far in the current search.
+    search_cursor: usize,
+
+    // Pre-compiled regex for the current search, reused across frames.
+    search_regex: Option<fancy_regex::Regex>,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -147,6 +160,10 @@ impl LogViewerApp {
             search_matches: Vec::new(),
             active_search_query: String::new(),
             search_just_submitted: false,
+            search_running: false,
+            search_cursor: 0,
+            search_regex: None,
+            search_error: None,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -223,6 +240,7 @@ impl LogViewerApp {
         self.search_results.clear();
         self.search_matches.clear();
         self.active_search_query.clear();
+        self.search_error = None;
         self.error_message = None;
 
         let compressed = is_compressed(path);
@@ -257,6 +275,9 @@ impl LogViewerApp {
         self.current_match = 0;
         self.scroll_offset = 0.0;
         self.search_just_submitted = false;
+        self.search_running = false;
+        self.search_cursor = 0;
+        self.search_regex = None;
     }
 
     fn start_following(&mut self) {
@@ -287,27 +308,56 @@ impl LogViewerApp {
         self.following = false;
     }
 
-    // Rebuild cached search results by scanning the mmap with memchr.
-    fn rebuild_search(&mut self) {
+    // Start an incremental search across frames. Compiles the regex then
+    // processes lines in batches so the UI stays responsive for large files.
+    fn start_search(&mut self) {
         self.search_results.clear();
         self.search_matches.clear();
+        self.search_error = None;
         self.current_match = 0;
 
-        let query = self.active_search_query.as_bytes();
-        if query.is_empty() || self.mmap.is_none() {
+        let pattern = self.active_search_query.as_str();
+        if pattern.is_empty() || self.mmap.is_none() {
             return;
         }
 
-        let mmap = self.mmap.as_ref().unwrap();
-        let finder = memchr::memmem::Finder::new(query);
-        let mut fi = 0usize;
+        match Regex::new(pattern) {
+            Ok(r) => {
+                self.search_regex = Some(r);
+                self.search_running = true;
+                self.search_cursor = 0;
+            }
+            Err(e) => {
+                self.search_error = Some(format!("Invalid regex: {}", e));
+            }
+        }
+    }
 
-        for (&start, line_idx) in self.line_offsets.iter().zip(0..) {
+    // Process the next batch of lines. Called once per frame while running.
+    fn advance_search(&mut self) {
+        const BATCH: usize = 100_000;
+        let regex = match self.search_regex.as_ref() {
+            Some(r) => r,
+            None => {
+                self.search_running = false;
+                return;
+            }
+        };
+        let mmap = match self.mmap.as_ref() {
+            Some(m) => m,
+            None => {
+                self.search_running = false;
+                return;
+            }
+        };
+
+        let batch_end = (self.search_cursor + BATCH).min(self.total_lines);
+
+        for line_idx in self.search_cursor..batch_end {
+            let start = self.line_offsets[line_idx];
             let end = if line_idx + 1 < self.total_lines {
-                // Exclude the newline byte
                 self.line_offsets[line_idx + 1] - 1
             } else {
-                // Last line: exclude trailing newline if present
                 let raw_end = mmap.len();
                 if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
                     raw_end - 1
@@ -316,17 +366,25 @@ impl LogViewerApp {
                 }
             };
             let line = &mmap[start..end];
+            let line_str = std::str::from_utf8(line).unwrap_or("");
 
-            if finder.find(line).is_some() {
+            if regex.find(line_str).is_ok_and(|m| m.is_some()) {
+                let fi = self.search_results.len();
                 self.search_results.push(line_idx);
 
-                let mut search_pos = 0;
-                while let Some(rel_pos) = finder.find(&line[search_pos..]) {
-                    self.search_matches.push((fi, search_pos + rel_pos));
-                    search_pos += rel_pos + query.len();
+                for m in regex.find_iter(line_str) {
+                    if let Ok(m) = m {
+                        self.search_matches
+                            .push((fi, m.start(), m.end() - m.start()));
+                    }
                 }
-                fi += 1;
             }
+        }
+
+        self.search_cursor = batch_end;
+        if self.search_cursor >= self.total_lines {
+            self.search_running = false;
+            self.search_regex = None;
         }
     }
 }
@@ -420,10 +478,19 @@ impl eframe::App for LogViewerApp {
                         self.active_search_query.clear();
                         self.search_results.clear();
                         self.search_matches.clear();
+                        self.search_error = None;
                         self.search_just_submitted = false;
+                        self.search_running = false;
+                        self.search_cursor = 0;
+                        self.search_regex = None;
                     }
                 }
             }
+        }
+
+        // Advance the incremental search by one batch per frame.
+        if self.search_running {
+            self.advance_search();
         }
 
         if self.open_requested {
@@ -619,7 +686,7 @@ impl eframe::App for LogViewerApp {
                         self.search_results.clear();
                         self.search_matches.clear();
                     } else if self.mmap.is_some() {
-                        self.rebuild_search();
+                        self.start_search();
                     }
                     self.current_match = 0;
                     self.search_just_submitted = true;
@@ -634,7 +701,7 @@ impl eframe::App for LogViewerApp {
                     } else {
                         self.current_match = (self.current_match + 1) % self.search_matches.len();
                     }
-                    let (fi, _) = self.search_matches[self.current_match];
+                    let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
                 }
             }
@@ -671,7 +738,7 @@ impl eframe::App for LogViewerApp {
 
             if next_match && !self.search_matches.is_empty() {
                 self.current_match = (self.current_match + 1) % self.search_matches.len();
-                let (fi, _) = self.search_matches[self.current_match];
+                let (fi, _, _) = self.search_matches[self.current_match];
                 self.scroll_offset = fi as f32 * row_height;
             }
             if prev_match && !self.search_matches.is_empty() {
@@ -680,7 +747,7 @@ impl eframe::App for LogViewerApp {
                 } else {
                     self.current_match - 1
                 };
-                let (fi, _) = self.search_matches[self.current_match];
+                let (fi, _, _) = self.search_matches[self.current_match];
                 self.scroll_offset = fi as f32 * row_height;
             }
 
@@ -705,7 +772,7 @@ impl eframe::App for LogViewerApp {
                 });
                 if down {
                     self.current_match = (self.current_match + 1) % self.search_matches.len();
-                    let (fi, _) = self.search_matches[self.current_match];
+                    let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
                 }
                 if up {
@@ -714,7 +781,7 @@ impl eframe::App for LogViewerApp {
                     } else {
                         self.current_match - 1
                     };
-                    let (fi, _) = self.search_matches[self.current_match];
+                    let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
                 }
             }
@@ -822,6 +889,27 @@ impl eframe::App for LogViewerApp {
                         );
                     });
                 });
+            } else if self.search_running {
+                // Searching in progress
+                let fill_rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                    let top_padding = ((fill_rect.height() - 30.0) / 2.0).max(0.0);
+                    ui.add_space(top_padding);
+                    ui.vertical_centered(|ui| {
+                        let pct = if self.total_lines > 0 {
+                            (self.search_cursor as f32 / self.total_lines as f32 * 100.0) as u32
+                        } else {
+                            0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Searching... {}%", pct))
+                                .size(18.0)
+                                .color(normal_color)
+                                .monospace(),
+                        );
+                    });
+                });
             } else {
                 // Normal log file rendering
                 let mmap = self.mmap.as_ref().unwrap();
@@ -831,7 +919,22 @@ impl eframe::App for LogViewerApp {
                 let search_matches = &self.search_matches;
                 let active_query = self.active_search_query.clone();
 
-                if has_query && total_rows == 0 {
+                if has_query && self.search_error.is_some() {
+                    let fill_rect = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                        let top_padding = ((fill_rect.height() - 30.0) / 2.0).max(0.0);
+                        ui.add_space(top_padding);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(self.search_error.as_ref().unwrap())
+                                    .size(18.0)
+                                    .color(egui::Color32::RED)
+                                    .monospace(),
+                            );
+                        });
+                    });
+                } else if has_query && total_rows == 0 {
                     let fill_rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
                     ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
@@ -888,33 +991,32 @@ impl eframe::App for LogViewerApp {
                                 } else {
                                     let mut job = egui::text::LayoutJob::default();
                                     let line_str = line.as_ref();
-                                    let mut start = 0;
-                                    while let Some(pos) = line_str[start..].find(&active_query) {
-                                        let abs_pos = start + pos;
-                                        if abs_pos > start {
+                                    let mut prev_end = 0;
+                                    for &(cm_fi, cm_off, cm_len) in search_matches {
+                                        if cm_fi != abs_fi {
+                                            continue;
+                                        }
+                                        if cm_off > prev_end {
                                             job.append(
-                                                &line_str[start..abs_pos],
+                                                &line_str[prev_end..cm_off],
                                                 0.0,
                                                 normal_fmt.clone(),
                                             );
                                         }
-                                        let is_current = search_matches
-                                            .get(self.current_match)
-                                            .map(|&(cm_fi, cm_off)| {
-                                                cm_fi == abs_fi && cm_off == abs_pos
-                                            })
-                                            .unwrap_or(false);
+                                        let is_current = self.current_match < search_matches.len()
+                                            && search_matches[self.current_match].0 == abs_fi
+                                            && search_matches[self.current_match].1 == cm_off;
                                         let fmt =
                                             if is_current { &current_fmt } else { &match_fmt };
                                         job.append(
-                                            &line_str[abs_pos..abs_pos + active_query.len()],
+                                            &line_str[cm_off..cm_off + cm_len],
                                             0.0,
                                             fmt.clone(),
                                         );
-                                        start = abs_pos + active_query.len();
+                                        prev_end = cm_off + cm_len;
                                     }
-                                    if start < line_str.len() {
-                                        job.append(&line_str[start..], 0.0, normal_fmt.clone());
+                                    if prev_end < line_str.len() {
+                                        job.append(&line_str[prev_end..], 0.0, normal_fmt.clone());
                                     }
                                     ui.add(egui::Label::new(job).wrap());
                                 }
