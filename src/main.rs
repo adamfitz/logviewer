@@ -10,6 +10,7 @@ use eframe::egui;
 // Standard library imports for CLI argument parsing, file I/O, and path handling.
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -126,6 +127,74 @@ struct LogViewerApp {
     // Set to true once the emoji font has been loaded into the egui context.
     // Prevents redundant font-atlas rebuilds on every frame.
     emoji_font_loaded: bool,
+
+    // True when the current file is compressed (.gz or .tar.gz).
+    // Disables follow mode (compressed files are static).
+    from_compressed: bool,
+}
+
+// Decompress a plain .gz file and return its content as text.
+// Non-UTF-8 bytes are replaced with U+FFFD replacement characters.
+fn read_gz(path: &PathBuf) -> String {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(err) => return format!("Failed to open {}: {}", path.display(), err),
+    };
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut raw = Vec::new();
+    match decoder.read_to_end(&mut raw) {
+        Ok(_) => String::from_utf8_lossy(&raw).to_string(),
+        Err(err) => format!("Failed to decompress {}: {}", path.display(), err),
+    }
+}
+
+// Returns true if the path is a compressed file (.gz or .tar.gz).
+fn is_compressed(path: &PathBuf) -> bool {
+    let s = path.to_string_lossy();
+    s.ends_with(".tar.gz") || s.ends_with(".gz")
+}
+
+// Extract text content from a .tar.gz archive.  Picks the first file whose
+// extension matches one of the recognised log-file extensions; if none do,
+// falls back to the very first entry in the archive.
+fn read_tar_gz(path: &PathBuf) -> String {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(err) => return format!("Failed to open archive: {}\nError: {}", path.display(), err),
+    };
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut fallback: Option<String> = None;
+    let log_exts = ["log", "txt", "out", "err", "stdout", "stderr"];
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(err) => return format!("Failed to read archive: {}\nError: {}", path.display(), err),
+    };
+    for result in entries {
+        let mut entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let entry_path = entry
+            .path()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let is_log = log_exts
+            .iter()
+            .any(|e| entry_path.ends_with(&format!(".{}", e)));
+        if fallback.is_none() {
+            let mut raw = Vec::new();
+            let _ = entry.read_to_end(&mut raw);
+            fallback = Some(String::from_utf8_lossy(&raw).to_string());
+        }
+        if is_log {
+            let mut raw = Vec::new();
+            let _ = entry.read_to_end(&mut raw);
+            return String::from_utf8_lossy(&raw).to_string();
+        }
+    }
+    fallback.unwrap_or_else(|| "Archive is empty or contains no readable files.".to_string())
 }
 
 impl LogViewerApp {
@@ -134,20 +203,30 @@ impl LogViewerApp {
     // Takes an optional PathBuf — if None, the app starts with no file loaded.
     fn new(file_path: Option<PathBuf>) -> Self {
         // If a path was provided, attempt to load the file; otherwise start empty.
-        let (lines, stored_path) = if let Some(ref path) = file_path {
-            let content = fs::read_to_string(path).unwrap_or_else(|err| {
-                format!(
-                    "Failed to open log file: {}\nError: {}",
-                    path.display(),
-                    err
-                )
-            });
+        let (lines, stored_path, from_compressed) = if let Some(ref path) = file_path {
+            let compressed = is_compressed(path);
+            let content = if compressed {
+                if path.to_string_lossy().ends_with(".tar.gz") {
+                    read_tar_gz(path)
+                } else {
+                    read_gz(path)
+                }
+            } else {
+                fs::read_to_string(path).unwrap_or_else(|err| {
+                    format!(
+                        "Failed to open log file: {}\nError: {}",
+                        path.display(),
+                        err
+                    )
+                })
+            };
             (
                 content.lines().map(|l| l.to_string()).collect(),
                 Some(path.clone()),
+                compressed,
             )
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, false)
         };
 
         Self {
@@ -165,30 +244,42 @@ impl LogViewerApp {
             follow_toggled: false,
             font_size: 14.0,
             emoji_font_loaded: false,
+            from_compressed,
         }
     }
 
     // Load a file into the viewer, replacing the current content.
     fn load_file(&mut self, path: &PathBuf) {
         self.stop_following();
-        let content = fs::read_to_string(path).unwrap_or_else(|err| {
-            format!(
-                "Failed to open log file: {}\nError: {}",
-                path.display(),
-                err
-            )
-        });
+        let compressed = is_compressed(path);
+        let content = if compressed {
+            if path.to_string_lossy().ends_with(".tar.gz") {
+                read_tar_gz(path)
+            } else {
+                read_gz(path)
+            }
+        } else {
+            fs::read_to_string(path).unwrap_or_else(|err| {
+                format!(
+                    "Failed to open log file: {}\nError: {}",
+                    path.display(),
+                    err
+                )
+            })
+        };
         self.lines = content.lines().map(|l| l.to_string()).collect();
         self.file_path = Some(path.clone());
+        self.from_compressed = compressed;
         self.search_query.clear();
         self.current_match = 0;
         self.scroll_offset = 0.0;
     }
 
     // Start watching the current file for changes (tail -f).
-    // Does nothing if no file is loaded or if already following.
+    // Does nothing if no file is loaded, if already following, or if the
+    // current content is from a compressed file (archives are static).
     fn start_following(&mut self) {
-        if self.following || self.file_path.is_none() {
+        if self.following || self.file_path.is_none() || self.from_compressed {
             return;
         }
 
@@ -311,7 +402,7 @@ impl eframe::App for LogViewerApp {
         // Handle deferred follow toggle (from GUI keybinds, Tools menu, or terminal t).
         if self.follow_toggled {
             self.follow_toggled = false;
-            if self.file_path.is_some() {
+            if self.file_path.is_some() && !self.from_compressed {
                 if self.following {
                     self.stop_following();
                 } else {
@@ -340,8 +431,10 @@ impl eframe::App for LogViewerApp {
             self.open_requested = false;
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter(
-                    "Log files",
-                    &["log", "txt", "out", "err", "stdout", "stderr"],
+                    "Log files (*.log, *.txt, *.gz, *.tar.gz)",
+                    &[
+                        "log", "txt", "out", "err", "stdout", "stderr", "gz", "tar.gz",
+                    ],
                 )
                 .pick_file()
             {
