@@ -218,6 +218,7 @@ impl eframe::App for LogViewerApp {
                                 egui::Sense::click(),
                             );
                             if response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                                 let hover_color =
                                     egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
                                 ui.painter().rect_filled(response.rect, 4.0, hover_color);
