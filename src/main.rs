@@ -10,6 +10,7 @@ use std::sync::{
     Arc,
 };
 
+use arboard::Clipboard;
 use fancy_regex::Regex;
 use keybinds::KeybindState;
 use notify::{self, EventKind, RecursiveMode, Watcher};
@@ -127,6 +128,23 @@ struct LogViewerApp {
 
     // Pre-compiled regex for the current search, reused across frames.
     search_regex: Option<fancy_regex::Regex>,
+
+    // True when reverse search is active (? in terminal mode).
+    // Reverses match cycling direction for n/N and Enter/Shift+Enter.
+    reverse_search: bool,
+
+    // Set when a reverse search is submitted; consumed on search completion
+    // to jump to the last match instead of the first.
+    pending_reverse_jump: bool,
+
+    // Set when yy is detected in terminal mode; consumed to copy current line.
+    yank_requested: bool,
+
+    // Which menu is currently open: None = closed, Some(0) = File, Some(1) = Tools.
+    open_menu: Option<usize>,
+
+    // True when the Font submenu in Tools is open (hovered).
+    font_submenu: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -164,6 +182,11 @@ impl LogViewerApp {
             search_cursor: 0,
             search_regex: None,
             search_error: None,
+            reverse_search: false,
+            pending_reverse_jump: false,
+            yank_requested: false,
+            open_menu: None,
+            font_submenu: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -278,6 +301,11 @@ impl LogViewerApp {
         self.search_running = false;
         self.search_cursor = 0;
         self.search_regex = None;
+        self.pending_reverse_jump = false;
+        self.reverse_search = false;
+        self.yank_requested = false;
+        self.open_menu = None;
+        self.font_submenu = false;
     }
 
     fn start_following(&mut self) {
@@ -389,6 +417,43 @@ impl LogViewerApp {
     }
 }
 
+// Helper: render a clickable row inside a dropdown menu (label + shortcut).
+// Returns the response for hover/click detection.
+fn menu_drop_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: &str,
+    action: &mut dyn FnMut(),
+) -> egui::Response {
+    let row_width = ui.available_width();
+    let inner = ui.horizontal(|ui| {
+        ui.set_min_width(row_width);
+        ui.label(egui::RichText::new(label).size(16.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !shortcut.is_empty() {
+                ui.add_space(12.0);
+                ui.weak(egui::RichText::new(shortcut).size(14.0));
+            }
+        });
+    });
+    let mut row_rect = inner.response.rect;
+    row_rect.max.x = row_rect.max.x.max(row_rect.min.x + row_width);
+    let response = ui.interact(
+        row_rect,
+        inner.response.id.with(label),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        let hover_color = egui::Color32::from_rgba_premultiplied(0, 0, 255, 80);
+        ui.painter().rect_filled(response.rect, 4.0, hover_color);
+    }
+    if response.clicked() {
+        action();
+    }
+    response
+}
+
 impl eframe::App for LogViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut visuals = if self.keybind_state.enabled {
@@ -453,6 +518,10 @@ impl eframe::App for LogViewerApp {
             if ui.input(|i| i.key_pressed(egui::Key::W) && i.modifiers.ctrl) {
                 self.follow_toggled = true;
             }
+            if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl) {
+                self.open_menu = Some(1);
+                self.font_submenu = true;
+            }
         }
 
         if self.follow_toggled {
@@ -483,14 +552,14 @@ impl eframe::App for LogViewerApp {
                         self.search_running = false;
                         self.search_cursor = 0;
                         self.search_regex = None;
+                        self.pending_reverse_jump = false;
+                        self.reverse_search = false;
+                        self.yank_requested = false;
+                        self.open_menu = None;
+                        self.font_submenu = false;
                     }
                 }
             }
-        }
-
-        // Advance the incremental search by one batch per frame.
-        if self.search_running {
-            self.advance_search();
         }
 
         if self.open_requested {
@@ -509,94 +578,188 @@ impl eframe::App for LogViewerApp {
         }
 
         frame.show(ui, |ui| {
-            // --- Menu bar ---
-            egui::MenuBar::new().ui(ui, |ui| {
-                let menu_item =
-                    |ui: &mut egui::Ui,
-                     label: &str,
-                     shortcut: &str,
-                     action: &mut dyn FnMut(&mut egui::Ui)| {
-                        let inner = ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).size(16.0));
-                            ui.add_space(48.0);
-                            ui.weak(egui::RichText::new(shortcut).size(14.0));
-                        });
-                        let response = ui.interact(
-                            inner.response.rect,
-                            inner.response.id.with(label),
-                            egui::Sense::click(),
-                        );
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                            let hover_color =
-                                egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
-                            ui.painter().rect_filled(response.rect, 4.0, hover_color);
-                        }
-                        if response.clicked() {
-                            action(ui);
-                        }
-                    };
-
-                ui.menu_button(egui::RichText::new("File").size(16.0), |ui| {
-                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
-                        self.open_requested = true;
-                        ui.close();
-                    });
-
-                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
-                        std::process::exit(0);
-                    });
+            // --- Menu bar (hover-to-open) ---
+            let mut new_open_menu = self.open_menu;
+            let mut file_btn_rect = egui::Rect::NOTHING;
+            let mut tools_btn_rect = egui::Rect::NOTHING;
+            let bar_response = egui::MenuBar::new().ui(ui, |ui| {
+                // File button
+                let file_label = egui::RichText::new("File").size(16.0);
+                let file_btn = egui::Button::new(file_label).fill(if self.open_menu == Some(0) {
+                    ui.visuals().widgets.active.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
                 });
+                let file_resp = ui.add(file_btn);
+                file_btn_rect = file_resp.rect;
 
-                ui.menu_button(egui::RichText::new("Tools").size(16.0), |ui| {
-                    let follow_label = if self.following {
-                        "Stop Following"
-                    } else {
-                        "Follow (tail -f)"
-                    };
-                    let follow_shortcut = if self.keybind_state.enabled {
-                        "t"
-                    } else {
-                        "Ctrl+W"
-                    };
-                    menu_item(ui, follow_label, follow_shortcut, &mut |menu_ui| {
-                        self.follow_toggled = true;
-                        menu_ui.close();
-                    });
-
-                    ui.separator();
-
-                    ui.menu_button(egui::RichText::new("Font").size(16.0), |ui| {
-                        let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
-                        for &(size, label) in &sizes {
-                            let is_current = (self.font_size - size).abs() < 0.01;
-                            let inner = ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(label).size(16.0));
-                                ui.add_space(48.0);
-                                ui.weak(
-                                    egui::RichText::new(if is_current { "*" } else { "" })
-                                        .size(14.0),
-                                );
-                            });
-                            let response = ui.interact(
-                                inner.response.rect,
-                                inner.response.id.with(label),
-                                egui::Sense::click(),
-                            );
-                            if response.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                let hover_color =
-                                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
-                                ui.painter().rect_filled(response.rect, 4.0, hover_color);
-                            }
-                            if response.clicked() {
-                                self.font_size = size;
-                                ui.close();
-                            }
-                        }
-                    });
+                // Tools button
+                let tools_label = egui::RichText::new("Tools").size(16.0);
+                let tools_btn = egui::Button::new(tools_label).fill(if self.open_menu == Some(1) {
+                    ui.visuals().widgets.active.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
                 });
+                let tools_resp = ui.add(tools_btn);
+                tools_btn_rect = tools_resp.rect;
+
+                // Click to toggle
+                if file_resp.clicked() {
+                    new_open_menu = if self.open_menu == Some(0) {
+                        None
+                    } else {
+                        Some(0)
+                    };
+                }
+                if tools_resp.clicked() {
+                    new_open_menu = if self.open_menu == Some(1) {
+                        None
+                    } else {
+                        Some(1)
+                    };
+                }
+
+                // Hover-to-switch
+                if self.open_menu.is_some() {
+                    if file_resp.hovered() && self.open_menu != Some(0) {
+                        new_open_menu = Some(0);
+                    }
+                    if tools_resp.hovered() && self.open_menu != Some(1) {
+                        new_open_menu = Some(1);
+                    }
+                }
             });
+
+            if new_open_menu.is_none() {
+                self.font_submenu = false;
+            }
+            self.open_menu = new_open_menu;
+
+            // Dropdown for the open menu
+            if let Some(menu) = self.open_menu {
+                let bar_bottom = bar_response.response.rect.bottom();
+                let anchor_x = match menu {
+                    0 => file_btn_rect.left(),
+                    1 => tools_btn_rect.left(),
+                    _ => 0.0,
+                };
+                let drop_pos = egui::pos2(anchor_x, bar_bottom);
+
+                let drop_id = egui::Id::new("menu_drop");
+                let mut font_item_top: Option<f32> = None;
+                let mut submenu_was_open = false;
+                let drop_response = egui::Area::new(drop_id)
+                    .fixed_pos(drop_pos)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        ui.set_max_width(150.0);
+                        ui.set_min_width(150.0);
+                        let mf = egui::Frame::menu(ui.style());
+                        mf.show(ui, |ui| {
+                            match menu {
+                                0 => {
+                                    // File menu
+                                    menu_drop_item(ui, "Open...", "Ctrl+O", &mut || {
+                                        self.open_requested = true;
+                                        self.open_menu = None;
+                                    });
+                                    menu_drop_item(ui, "Quit", "Ctrl+Q", &mut || {
+                                        std::process::exit(0);
+                                    });
+                                }
+                                1 => {
+                                    // Tools menu
+                                    submenu_was_open = self.font_submenu;
+                                    let follow_label = if self.following {
+                                        "Stop Following"
+                                    } else {
+                                        "Follow"
+                                    };
+                                    let follow_shortcut = if self.keybind_state.enabled {
+                                        "t"
+                                    } else {
+                                        "Ctrl+W"
+                                    };
+                                    menu_drop_item(ui, follow_label, follow_shortcut, &mut || {
+                                        self.follow_toggled = true;
+                                        self.open_menu = None;
+                                    });
+
+                                    ui.separator();
+
+                                    let font_resp = menu_drop_item(ui, "Font", "", &mut || {});
+                                    font_item_top = Some(font_resp.rect.top());
+                                    let in_bridge = submenu_was_open
+                                        && ui.input(|i| {
+                                            i.pointer.hover_pos().is_some_and(|p| {
+                                                p.y >= font_resp.rect.top() - 8.0
+                                                    && p.y <= font_resp.rect.bottom() + 8.0
+                                                    && p.x >= font_resp.rect.right()
+                                            })
+                                        });
+                                    if font_resp.hovered() || in_bridge {
+                                        self.font_submenu = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
+                    });
+
+                // Close menu on click outside the dropdown
+                let click_outside = ui
+                    .input(|i| i.pointer.any_click().then(|| i.pointer.interact_pos()))
+                    .flatten()
+                    .is_some_and(|p| {
+                        let in_drop = drop_response.response.rect.contains(p);
+                        let in_bar = bar_response.response.rect.contains(p);
+                        // Also check inside the menu button that triggered this menu
+                        let in_btn = match menu {
+                            0 => file_btn_rect.contains(p),
+                            1 => tools_btn_rect.contains(p),
+                            _ => false,
+                        };
+                        !in_drop && !in_bar && !in_btn
+                    });
+                if click_outside {
+                    self.open_menu = None;
+                }
+
+                // Font submenu (Tools > Font > sizes)
+                if menu == 1 && (self.font_submenu || submenu_was_open) {
+                    let sub_y = font_item_top.unwrap_or(drop_response.response.rect.top());
+                    let sub_pos = egui::pos2(drop_response.response.rect.right() - 8.0, sub_y);
+                    let sub_resp = egui::Area::new("menu_font_sub".into())
+                        .fixed_pos(sub_pos)
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            ui.set_max_width(120.0);
+                            ui.set_min_width(120.0);
+                            let mf = egui::Frame::menu(ui.style());
+                            mf.show(ui, |ui| {
+                                let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
+                                for &(size, label) in &sizes {
+                                    let is_current = (self.font_size - size).abs() < 0.01;
+                                    let star = if is_current { "*" } else { "" };
+                                    let resp = menu_drop_item(ui, label, star, &mut || {
+                                        self.font_size = size;
+                                        self.open_menu = None;
+                                    });
+                                    if resp.hovered() {
+                                        self.font_submenu = true;
+                                    }
+                                }
+                            })
+                        });
+                    if ui.input(|i| {
+                        i.pointer
+                            .hover_pos()
+                            .is_some_and(|p| sub_resp.response.rect.contains(p))
+                    }) {
+                        self.font_submenu = true;
+                    }
+                }
+            }
 
             // --- Header bar ---
             let search_response = ui.horizontal(|ui| {
@@ -619,8 +782,12 @@ impl eframe::App for LogViewerApp {
                     egui::TextEdit::singleline(&mut self.search_query)
                         .font(egui::FontId::monospace(18.0))
                         .hint_text(
-                            egui::RichText::new("type search and press Enter")
-                                .font(egui::FontId::monospace(18.0)),
+                            egui::RichText::new(if self.reverse_search {
+                                "reverse: type search and press Enter"
+                            } else {
+                                "type search and press Enter"
+                            })
+                            .font(egui::FontId::monospace(18.0)),
                         ),
                 );
                 let label = if self.keybind_state.enabled {
@@ -651,6 +818,22 @@ impl eframe::App for LogViewerApp {
 
             ui.separator();
 
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+            // Advance the incremental search by one batch per frame.
+            if self.search_running {
+                let was_running = self.search_running;
+                self.advance_search();
+                if was_running && !self.search_running && self.pending_reverse_jump {
+                    if !self.search_matches.is_empty() {
+                        self.current_match = self.search_matches.len() - 1;
+                        let (fi, _, _) = self.search_matches[self.current_match];
+                        self.scroll_offset = fi as f32 * row_height;
+                    }
+                    self.pending_reverse_jump = false;
+                }
+            }
+
             let search_text_response = search_response.inner;
             let search_has_focus = search_text_response.has_focus();
 
@@ -671,8 +854,6 @@ impl eframe::App for LogViewerApp {
                 }
             }
 
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-
             // Enter / Shift+Enter: submit new query or cycle through matches.
             // TextEdit::singleline surrenders focus on Enter, so we check the
             // Enter key globally (not guarded by search_has_focus) so that
@@ -691,15 +872,34 @@ impl eframe::App for LogViewerApp {
                     self.current_match = 0;
                     self.search_just_submitted = true;
                     self.scroll_offset = 0.0;
+                    if self.reverse_search && self.active_search_query.len() > 0 {
+                        self.pending_reverse_jump = true;
+                    }
                 } else if search_has_focus && !self.search_matches.is_empty() {
-                    if shift {
-                        self.current_match = if self.current_match == 0 {
-                            self.search_matches.len() - 1
+                    if self.reverse_search {
+                        // Reverse mode: Enter goes backward, Shift+Enter goes forward
+                        if shift {
+                            self.current_match =
+                                (self.current_match + 1) % self.search_matches.len();
                         } else {
-                            self.current_match - 1
-                        };
+                            self.current_match = if self.current_match == 0 {
+                                self.search_matches.len() - 1
+                            } else {
+                                self.current_match - 1
+                            };
+                        }
                     } else {
-                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                        // Normal mode: Enter goes forward, Shift+Enter goes backward
+                        if shift {
+                            self.current_match = if self.current_match == 0 {
+                                self.search_matches.len() - 1
+                            } else {
+                                self.current_match - 1
+                            };
+                        } else {
+                            self.current_match =
+                                (self.current_match + 1) % self.search_matches.len();
+                        }
                     }
                     let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
@@ -722,6 +922,8 @@ impl eframe::App for LogViewerApp {
             let mut next_match = false;
             let mut prev_match = false;
             let mut follow_toggled = false;
+            let mut go_to_top = false;
+            let mut go_to_bottom = false;
             let should_quit = keybinds::process_keybinds(
                 ui.ctx(),
                 &mut self.keybind_state,
@@ -734,21 +936,90 @@ impl eframe::App for LogViewerApp {
                 &mut prev_match,
                 &mut self.open_requested,
                 &mut follow_toggled,
+                &mut self.reverse_search,
+                &mut go_to_top,
+                &mut go_to_bottom,
+                &mut self.yank_requested,
             );
 
-            if next_match && !self.search_matches.is_empty() {
-                self.current_match = (self.current_match + 1) % self.search_matches.len();
-                let (fi, _, _) = self.search_matches[self.current_match];
-                self.scroll_offset = fi as f32 * row_height;
+            if self.keybind_state.enabled
+                && ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl)
+            {
+                self.open_menu = Some(1);
+                self.font_submenu = true;
             }
-            if prev_match && !self.search_matches.is_empty() {
-                self.current_match = if self.current_match == 0 {
-                    self.search_matches.len() - 1
+
+            if !self.search_matches.is_empty() {
+                if go_to_top {
+                    self.current_match = 0;
+                } else if go_to_bottom {
+                    self.current_match = self.search_matches.len() - 1;
+                } else if self.reverse_search {
+                    // Reverse mode: n goes backward, N goes forward
+                    if next_match {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    }
+                    if prev_match {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
                 } else {
-                    self.current_match - 1
-                };
-                let (fi, _, _) = self.search_matches[self.current_match];
-                self.scroll_offset = fi as f32 * row_height;
+                    // Normal mode: n goes forward, N goes backward
+                    if next_match {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
+                    if prev_match {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    }
+                }
+                // Don't overwrite scroll_offset for g/G — the keybinds handler
+                // already set it to f32::MIN (top) or total_rows * row_height (bottom).
+                if !go_to_top && !go_to_bottom {
+                    let (fi, _, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
+                }
+            }
+
+            if self.yank_requested {
+                self.yank_requested = false;
+                if let (Some(mmap), line_offsets) = (self.mmap.as_ref(), &self.line_offsets) {
+                    let total = if has_query {
+                        self.search_results.len()
+                    } else {
+                        self.total_lines
+                    };
+                    let top_line = ((self.scroll_offset / row_height).round() as usize)
+                        .min(total.saturating_sub(1));
+                    if total > 0 {
+                        let line_idx = if has_query {
+                            self.search_results[top_line]
+                        } else {
+                            top_line
+                        };
+                        let start = line_offsets[line_idx];
+                        let end = if line_idx + 1 < self.total_lines {
+                            line_offsets[line_idx + 1] - 1
+                        } else {
+                            let raw_end = mmap.len();
+                            if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
+                                raw_end - 1
+                            } else {
+                                raw_end
+                            }
+                        };
+                        let line_text = String::from_utf8_lossy(&mmap[start..end]).to_string();
+                        if let Ok(mut cb) = Clipboard::new() {
+                            let _ = cb.set_text(line_text);
+                        }
+                    }
+                }
             }
 
             self.follow_toggled = self.follow_toggled || follow_toggled;
@@ -973,7 +1244,7 @@ impl eframe::App for LogViewerApp {
                             let line_bytes = &mmap[start..end];
                             let line = String::from_utf8_lossy(line_bytes);
 
-                            ui.horizontal(|ui| {
+                            let row_response = ui.horizontal(|ui| {
                                 ui.add_sized(
                                     egui::vec2(72.0, row_height),
                                     egui::Label::new(
@@ -986,7 +1257,8 @@ impl eframe::App for LogViewerApp {
                                         egui::Label::new(
                                             egui::RichText::new(line.as_ref()).monospace(),
                                         )
-                                        .wrap(),
+                                        .wrap()
+                                        .selectable(true),
                                     );
                                 } else {
                                     let mut job = egui::text::LayoutJob::default();
@@ -1018,9 +1290,15 @@ impl eframe::App for LogViewerApp {
                                     if prev_end < line_str.len() {
                                         job.append(&line_str[prev_end..], 0.0, normal_fmt.clone());
                                     }
-                                    ui.add(egui::Label::new(job).wrap());
+                                    ui.add(egui::Label::new(job).wrap().selectable(true));
                                 }
                             });
+                            if row_response.response.secondary_clicked() {
+                                let line_text = line.to_string();
+                                if let Ok(mut cb) = Clipboard::new() {
+                                    let _ = cb.set_text(line_text);
+                                }
+                            }
                         }
                     });
                 }
