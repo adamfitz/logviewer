@@ -29,8 +29,8 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 ## Usage
 
 ```
-logviewer                  # start empty, use File > Open
-logviewer <path/to/logfile.log>  # open directly
+logviewer                         # start empty, use File > Open
+logviewer <path/to/logfile.log>   # open directly
 ```
 
 ### Keybinds

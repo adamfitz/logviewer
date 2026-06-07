@@ -139,6 +139,12 @@ struct LogViewerApp {
 
     // Set when yy is detected in terminal mode; consumed to copy current line.
     yank_requested: bool,
+
+    // Which menu is currently open: None = closed, Some(0) = File, Some(1) = Tools.
+    open_menu: Option<usize>,
+
+    // True when the Font submenu in Tools is open (hovered).
+    font_submenu: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -179,6 +185,8 @@ impl LogViewerApp {
             reverse_search: false,
             pending_reverse_jump: false,
             yank_requested: false,
+            open_menu: None,
+            font_submenu: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -296,6 +304,8 @@ impl LogViewerApp {
         self.pending_reverse_jump = false;
         self.reverse_search = false;
         self.yank_requested = false;
+        self.open_menu = None;
+        self.font_submenu = false;
     }
 
     fn start_following(&mut self) {
@@ -407,6 +417,35 @@ impl LogViewerApp {
     }
 }
 
+// Helper: render a clickable row inside a dropdown menu (label + shortcut).
+// Returns the response for hover/click detection.
+fn menu_drop_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: &str,
+    action: &mut dyn FnMut(),
+) -> egui::Response {
+    let inner = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).size(16.0));
+        ui.add_space(48.0);
+        ui.weak(egui::RichText::new(shortcut).size(14.0));
+    });
+    let response = ui.interact(
+        inner.response.rect,
+        inner.response.id.with(label),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        let hover_color = egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+        ui.painter().rect_filled(response.rect, 4.0, hover_color);
+    }
+    if response.clicked() {
+        action();
+    }
+    response
+}
+
 impl eframe::App for LogViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut visuals = if self.keybind_state.enabled {
@@ -504,6 +543,8 @@ impl eframe::App for LogViewerApp {
                         self.pending_reverse_jump = false;
                         self.reverse_search = false;
                         self.yank_requested = false;
+                        self.open_menu = None;
+                        self.font_submenu = false;
                     }
                 }
             }
@@ -525,94 +566,184 @@ impl eframe::App for LogViewerApp {
         }
 
         frame.show(ui, |ui| {
-            // --- Menu bar ---
-            egui::MenuBar::new().ui(ui, |ui| {
-                let menu_item =
-                    |ui: &mut egui::Ui,
-                     label: &str,
-                     shortcut: &str,
-                     action: &mut dyn FnMut(&mut egui::Ui)| {
-                        let inner = ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).size(16.0));
-                            ui.add_space(48.0);
-                            ui.weak(egui::RichText::new(shortcut).size(14.0));
-                        });
-                        let response = ui.interact(
-                            inner.response.rect,
-                            inner.response.id.with(label),
-                            egui::Sense::click(),
-                        );
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                            let hover_color =
-                                egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
-                            ui.painter().rect_filled(response.rect, 4.0, hover_color);
-                        }
-                        if response.clicked() {
-                            action(ui);
-                        }
-                    };
-
-                ui.menu_button(egui::RichText::new("File").size(16.0), |ui| {
-                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
-                        self.open_requested = true;
-                        ui.close();
-                    });
-
-                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
-                        std::process::exit(0);
-                    });
+            // --- Menu bar (hover-to-open) ---
+            let mut new_open_menu = self.open_menu;
+            let mut file_btn_rect = egui::Rect::NOTHING;
+            let mut tools_btn_rect = egui::Rect::NOTHING;
+            let bar_response = egui::MenuBar::new().ui(ui, |ui| {
+                // File button
+                let file_label = egui::RichText::new("File").size(16.0);
+                let file_btn = egui::Button::new(file_label).fill(if self.open_menu == Some(0) {
+                    ui.visuals().widgets.active.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
                 });
+                let file_resp = ui.add(file_btn);
+                file_btn_rect = file_resp.rect;
 
-                ui.menu_button(egui::RichText::new("Tools").size(16.0), |ui| {
-                    let follow_label = if self.following {
-                        "Stop Following"
-                    } else {
-                        "Follow (tail -f)"
-                    };
-                    let follow_shortcut = if self.keybind_state.enabled {
-                        "t"
-                    } else {
-                        "Ctrl+W"
-                    };
-                    menu_item(ui, follow_label, follow_shortcut, &mut |menu_ui| {
-                        self.follow_toggled = true;
-                        menu_ui.close();
-                    });
-
-                    ui.separator();
-
-                    ui.menu_button(egui::RichText::new("Font").size(16.0), |ui| {
-                        let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
-                        for &(size, label) in &sizes {
-                            let is_current = (self.font_size - size).abs() < 0.01;
-                            let inner = ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(label).size(16.0));
-                                ui.add_space(48.0);
-                                ui.weak(
-                                    egui::RichText::new(if is_current { "*" } else { "" })
-                                        .size(14.0),
-                                );
-                            });
-                            let response = ui.interact(
-                                inner.response.rect,
-                                inner.response.id.with(label),
-                                egui::Sense::click(),
-                            );
-                            if response.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                let hover_color =
-                                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
-                                ui.painter().rect_filled(response.rect, 4.0, hover_color);
-                            }
-                            if response.clicked() {
-                                self.font_size = size;
-                                ui.close();
-                            }
-                        }
-                    });
+                // Tools button
+                let tools_label = egui::RichText::new("Tools").size(16.0);
+                let tools_btn = egui::Button::new(tools_label).fill(if self.open_menu == Some(1) {
+                    ui.visuals().widgets.active.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
                 });
+                let tools_resp = ui.add(tools_btn);
+                tools_btn_rect = tools_resp.rect;
+
+                // Click to toggle
+                if file_resp.clicked() {
+                    new_open_menu = if self.open_menu == Some(0) {
+                        None
+                    } else {
+                        Some(0)
+                    };
+                }
+                if tools_resp.clicked() {
+                    new_open_menu = if self.open_menu == Some(1) {
+                        None
+                    } else {
+                        Some(1)
+                    };
+                }
+
+                // Hover-to-switch
+                if self.open_menu.is_some() {
+                    if file_resp.hovered() && self.open_menu != Some(0) {
+                        new_open_menu = Some(0);
+                    }
+                    if tools_resp.hovered() && self.open_menu != Some(1) {
+                        new_open_menu = Some(1);
+                    }
+                }
             });
+
+            self.open_menu = new_open_menu;
+
+            // Dropdown for the open menu
+            if let Some(menu) = self.open_menu {
+                let bar_bottom = bar_response.response.rect.bottom();
+                let anchor_x = match menu {
+                    0 => file_btn_rect.left(),
+                    1 => tools_btn_rect.left(),
+                    _ => 0.0,
+                };
+                let drop_pos = egui::pos2(anchor_x, bar_bottom);
+
+                let drop_id = egui::Id::new("menu_drop");
+                let mut font_item_top: Option<f32> = None;
+                let mut submenu_was_open = false;
+                let drop_response = egui::Area::new(drop_id)
+                    .fixed_pos(drop_pos)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        ui.set_min_width(200.0);
+                        let mf = egui::Frame::menu(ui.style());
+                        mf.show(ui, |ui| {
+                            match menu {
+                                0 => {
+                                    // File menu
+                                    menu_drop_item(ui, "Open...", "Ctrl+O", &mut || {
+                                        self.open_requested = true;
+                                        self.open_menu = None;
+                                    });
+                                    menu_drop_item(ui, "Quit", "Ctrl+Q", &mut || {
+                                        std::process::exit(0);
+                                    });
+                                }
+                                1 => {
+                                    // Tools menu
+                                    submenu_was_open = self.font_submenu;
+                                    self.font_submenu = false;
+                                    let follow_label = if self.following {
+                                        "Stop Following"
+                                    } else {
+                                        "Follow (tail -f)"
+                                    };
+                                    let follow_shortcut = if self.keybind_state.enabled {
+                                        "t"
+                                    } else {
+                                        "Ctrl+W"
+                                    };
+                                    menu_drop_item(ui, follow_label, follow_shortcut, &mut || {
+                                        self.follow_toggled = true;
+                                        self.open_menu = None;
+                                    });
+
+                                    ui.separator();
+
+                                    let font_resp = menu_drop_item(ui, "Font", "", &mut || {});
+                                    font_item_top = Some(font_resp.rect.top());
+                                    let in_bridge = submenu_was_open
+                                        && ui.input(|i| {
+                                            i.pointer.hover_pos().is_some_and(|p| {
+                                                p.y >= font_resp.rect.top() - 8.0
+                                                    && p.y <= font_resp.rect.bottom() + 8.0
+                                                    && p.x >= font_resp.rect.right()
+                                            })
+                                        });
+                                    if font_resp.hovered() || in_bridge {
+                                        self.font_submenu = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
+                    });
+
+                // Close menu on click outside the dropdown
+                let click_outside = ui
+                    .input(|i| i.pointer.any_click().then(|| i.pointer.interact_pos()))
+                    .flatten()
+                    .is_some_and(|p| {
+                        let in_drop = drop_response.response.rect.contains(p);
+                        let in_bar = bar_response.response.rect.contains(p);
+                        // Also check inside the menu button that triggered this menu
+                        let in_btn = match menu {
+                            0 => file_btn_rect.contains(p),
+                            1 => tools_btn_rect.contains(p),
+                            _ => false,
+                        };
+                        !in_drop && !in_bar && !in_btn
+                    });
+                if click_outside {
+                    self.open_menu = None;
+                }
+
+                // Font submenu (Tools > Font > sizes)
+                if menu == 1 && (self.font_submenu || submenu_was_open) {
+                    let sub_y = font_item_top.unwrap_or(drop_response.response.rect.top());
+                    let sub_pos = egui::pos2(drop_response.response.rect.right() - 8.0, sub_y);
+                    let sub_resp = egui::Area::new("menu_font_sub".into())
+                        .fixed_pos(sub_pos)
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_width(160.0);
+                            let mf = egui::Frame::menu(ui.style());
+                            mf.show(ui, |ui| {
+                                let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
+                                for &(size, label) in &sizes {
+                                    let is_current = (self.font_size - size).abs() < 0.01;
+                                    let star = if is_current { "*" } else { "" };
+                                    let resp = menu_drop_item(ui, label, star, &mut || {
+                                        self.font_size = size;
+                                        self.open_menu = None;
+                                    });
+                                    if resp.hovered() {
+                                        self.font_submenu = true;
+                                    }
+                                }
+                            })
+                        });
+                    if ui.input(|i| {
+                        i.pointer
+                            .hover_pos()
+                            .is_some_and(|p| sub_resp.response.rect.contains(p))
+                    }) {
+                        self.font_submenu = true;
+                    }
+                }
+            }
 
             // --- Header bar ---
             let search_response = ui.horizontal(|ui| {
