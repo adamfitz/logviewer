@@ -107,8 +107,13 @@ struct LogViewerApp {
     // Each entry is (result_index, byte_offset_within_line).
     search_matches: Vec<(usize, usize)>,
 
-    // Previous query value for change detection.
-    last_search_query: String,
+    // The submitted search query (Enter pressed). Only this query triggers
+    // search — typing in the search box alone does nothing until Enter.
+    active_search_query: String,
+
+    // True on the frame after search is submitted, so the scroll area
+    // resets to the top of the filtered results.
+    search_just_submitted: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -140,7 +145,8 @@ impl LogViewerApp {
             from_compressed: false,
             search_results: Vec::new(),
             search_matches: Vec::new(),
-            last_search_query: String::new(),
+            active_search_query: String::new(),
+            search_just_submitted: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -216,7 +222,7 @@ impl LogViewerApp {
         self.line_offsets.clear();
         self.search_results.clear();
         self.search_matches.clear();
-        self.last_search_query.clear();
+        self.active_search_query.clear();
         self.error_message = None;
 
         let compressed = is_compressed(path);
@@ -247,8 +253,10 @@ impl LogViewerApp {
         }
 
         self.search_query.clear();
+        self.active_search_query.clear();
         self.current_match = 0;
         self.scroll_offset = 0.0;
+        self.search_just_submitted = false;
     }
 
     fn start_following(&mut self) {
@@ -285,7 +293,7 @@ impl LogViewerApp {
         self.search_matches.clear();
         self.current_match = 0;
 
-        let query = self.search_query.as_bytes();
+        let query = self.active_search_query.as_bytes();
         if query.is_empty() || self.mmap.is_none() {
             return;
         }
@@ -409,9 +417,10 @@ impl eframe::App for LogViewerApp {
                         self.total_lines = self.line_offsets.len();
                         self.mmap = Some(mmap);
                         self.search_query.clear();
-                        self.last_search_query.clear();
+                        self.active_search_query.clear();
                         self.search_results.clear();
                         self.search_matches.clear();
+                        self.search_just_submitted = false;
                     }
                 }
             }
@@ -595,46 +604,51 @@ impl eframe::App for LogViewerApp {
                 }
             }
 
-            // --- Rebuild search cache when query changes ---
-            if self.search_query != self.last_search_query {
-                self.last_search_query = self.search_query.clone();
-                if self.mmap.is_some() {
-                    self.rebuild_search();
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+            // Enter / Shift+Enter: submit new query or cycle through matches.
+            // TextEdit::singleline surrenders focus on Enter, so we check the
+            // Enter key globally (not guarded by search_has_focus) so that
+            // submission works. Cycling still requires focus.
+            let (enter, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+            if enter {
+                let new_query = self.search_query != self.active_search_query;
+                if new_query {
+                    self.active_search_query = self.search_query.clone();
+                    if self.active_search_query.is_empty() {
+                        self.search_results.clear();
+                        self.search_matches.clear();
+                    } else if self.mmap.is_some() {
+                        self.rebuild_search();
+                    }
+                    self.current_match = 0;
+                    self.search_just_submitted = true;
+                    self.scroll_offset = 0.0;
+                } else if search_has_focus && !self.search_matches.is_empty() {
+                    if shift {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    } else {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
+                    let (fi, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
                 }
             }
 
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-
-            let has_query = !self.search_query.is_empty();
+            // Compute these AFTER the Enter handler so clearing the search
+            // (which empties search_results / search_matches) is reflected.
+            let has_query = !self.active_search_query.is_empty();
             let total_rows = if has_query {
                 self.search_results.len()
             } else {
                 self.total_lines
             };
-
-            // Build match positions for Enter-based cycling (only when searching).
-            // search_matches is already populated by rebuild_search().
             if self.current_match >= self.search_matches.len() {
                 self.current_match = 0;
-            }
-
-            // Enter / Shift+Enter cycling
-            if search_has_focus && !self.search_matches.is_empty() {
-                let (enter, shift) =
-                    ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
-                if enter && !shift {
-                    self.current_match = (self.current_match + 1) % self.search_matches.len();
-                    let (fi, _) = self.search_matches[self.current_match];
-                    self.scroll_offset = fi as f32 * row_height;
-                } else if enter && shift {
-                    self.current_match = if self.current_match == 0 {
-                        self.search_matches.len() - 1
-                    } else {
-                        self.current_match - 1
-                    };
-                    let (fi, _) = self.search_matches[self.current_match];
-                    self.scroll_offset = fi as f32 * row_height;
-                }
             }
 
             // Terminal keybinds
@@ -710,9 +724,10 @@ impl eframe::App for LogViewerApp {
                 .auto_shrink(false)
                 .stick_to_bottom(self.following)
                 .scroll_source(ScrollSource::SCROLL_BAR | ScrollSource::MOUSE_WHEEL);
-            if self.scroll_offset != 0.0 {
+            if self.scroll_offset != 0.0 || self.search_just_submitted {
                 scroll_area = scroll_area.vertical_scroll_offset(self.scroll_offset);
                 self.scroll_offset = 0.0;
+                self.search_just_submitted = false;
             }
 
             // Pre-compute text formats for search highlighting
@@ -814,80 +829,99 @@ impl eframe::App for LogViewerApp {
                 let total_lines = self.total_lines;
                 let search_results = &self.search_results;
                 let search_matches = &self.search_matches;
-                let query = &self.search_query;
+                let active_query = self.active_search_query.clone();
 
-                scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                    for abs_fi in row_range {
-                        let line_idx = if has_query {
-                            search_results[abs_fi]
-                        } else {
-                            abs_fi
-                        };
-
-                        let start = line_offsets[line_idx];
-                        let end = if line_idx + 1 < total_lines {
-                            line_offsets[line_idx + 1] - 1
-                        } else {
-                            let raw_end = mmap.len();
-                            if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
-                                raw_end - 1
-                            } else {
-                                raw_end
-                            }
-                        };
-
-                        let line_bytes = &mmap[start..end];
-                        let line = String::from_utf8_lossy(line_bytes);
-
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                egui::vec2(72.0, row_height),
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{:>6}", line_idx + 1)).monospace(),
-                                ),
+                if has_query && total_rows == 0 {
+                    let fill_rect = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                        let top_padding = ((fill_rect.height() - 30.0) / 2.0).max(0.0);
+                        ui.add_space(top_padding);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("No matches found")
+                                    .size(18.0)
+                                    .color(normal_color)
+                                    .monospace(),
                             );
-                            if query.is_empty() {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(line.as_ref()).monospace(),
-                                    )
-                                    .wrap(),
-                                );
-                            } else {
-                                let mut job = egui::text::LayoutJob::default();
-                                let line_str = line.as_ref();
-                                let mut start = 0;
-                                while let Some(pos) = line_str[start..].find(query) {
-                                    let abs_pos = start + pos;
-                                    if abs_pos > start {
-                                        job.append(
-                                            &line_str[start..abs_pos],
-                                            0.0,
-                                            normal_fmt.clone(),
-                                        );
-                                    }
-                                    let is_current = search_matches
-                                        .get(self.current_match)
-                                        .map(|&(cm_fi, cm_off)| {
-                                            cm_fi == abs_fi && cm_off == abs_pos
-                                        })
-                                        .unwrap_or(false);
-                                    let fmt = if is_current { &current_fmt } else { &match_fmt };
-                                    job.append(
-                                        &line_str[abs_pos..abs_pos + query.len()],
-                                        0.0,
-                                        fmt.clone(),
-                                    );
-                                    start = abs_pos + query.len();
-                                }
-                                if start < line_str.len() {
-                                    job.append(&line_str[start..], 0.0, normal_fmt.clone());
-                                }
-                                ui.add(egui::Label::new(job).wrap());
-                            }
                         });
-                    }
-                });
+                    });
+                } else {
+                    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+                        for abs_fi in row_range {
+                            let line_idx = if has_query {
+                                search_results[abs_fi]
+                            } else {
+                                abs_fi
+                            };
+
+                            let start = line_offsets[line_idx];
+                            let end = if line_idx + 1 < total_lines {
+                                line_offsets[line_idx + 1] - 1
+                            } else {
+                                let raw_end = mmap.len();
+                                if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
+                                    raw_end - 1
+                                } else {
+                                    raw_end
+                                }
+                            };
+
+                            let line_bytes = &mmap[start..end];
+                            let line = String::from_utf8_lossy(line_bytes);
+
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    egui::vec2(72.0, row_height),
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{:>6}", line_idx + 1))
+                                            .monospace(),
+                                    ),
+                                );
+                                if active_query.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line.as_ref()).monospace(),
+                                        )
+                                        .wrap(),
+                                    );
+                                } else {
+                                    let mut job = egui::text::LayoutJob::default();
+                                    let line_str = line.as_ref();
+                                    let mut start = 0;
+                                    while let Some(pos) = line_str[start..].find(&active_query) {
+                                        let abs_pos = start + pos;
+                                        if abs_pos > start {
+                                            job.append(
+                                                &line_str[start..abs_pos],
+                                                0.0,
+                                                normal_fmt.clone(),
+                                            );
+                                        }
+                                        let is_current = search_matches
+                                            .get(self.current_match)
+                                            .map(|&(cm_fi, cm_off)| {
+                                                cm_fi == abs_fi && cm_off == abs_pos
+                                            })
+                                            .unwrap_or(false);
+                                        let fmt =
+                                            if is_current { &current_fmt } else { &match_fmt };
+                                        job.append(
+                                            &line_str[abs_pos..abs_pos + active_query.len()],
+                                            0.0,
+                                            fmt.clone(),
+                                        );
+                                        start = abs_pos + active_query.len();
+                                    }
+                                    if start < line_str.len() {
+                                        job.append(&line_str[start..], 0.0, normal_fmt.clone());
+                                    }
+                                    ui.add(egui::Label::new(job).wrap());
+                                }
+                            });
+                        }
+                    });
+                }
             }
         });
     }
