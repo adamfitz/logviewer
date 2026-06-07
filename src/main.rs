@@ -18,6 +18,9 @@ use keybinds::KeybindState;
 // Native file dialog for the Open menu action.
 use rfd;
 
+// Scroll source flags for the ScrollArea (disable drag-to-scroll).
+use eframe::egui::containers::scroll_area::ScrollSource;
+
 // The application state struct. In egui's immediate-mode model, this struct is
 // the single source of truth — everything the UI needs to render a frame lives here.
 // Each frame, egui calls ui() and re-draws the entire interface from this state.
@@ -485,7 +488,11 @@ impl eframe::App for LogViewerApp {
             // to whatever the current position is to get relative movement.
             // After consuming it, reset to 0.0 so the view does not keep scrolling
             // on frames where no key is pressed.
-            let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+            let mut scroll_area = egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .stick_to_bottom(false)
+                .scroll_source(ScrollSource::SCROLL_BAR | ScrollSource::MOUSE_WHEEL);
             if self.scroll_offset != 0.0 {
                 // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
                 // is simpler and works correctly for all movements including page up/down.
