@@ -425,19 +425,27 @@ fn menu_drop_item(
     shortcut: &str,
     action: &mut dyn FnMut(),
 ) -> egui::Response {
+    let row_width = ui.available_width();
     let inner = ui.horizontal(|ui| {
+        ui.set_min_width(row_width);
         ui.label(egui::RichText::new(label).size(16.0));
-        ui.add_space(48.0);
-        ui.weak(egui::RichText::new(shortcut).size(14.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !shortcut.is_empty() {
+                ui.add_space(12.0);
+                ui.weak(egui::RichText::new(shortcut).size(14.0));
+            }
+        });
     });
+    let mut row_rect = inner.response.rect;
+    row_rect.max.x = row_rect.max.x.max(row_rect.min.x + row_width);
     let response = ui.interact(
-        inner.response.rect,
+        row_rect,
         inner.response.id.with(label),
         egui::Sense::click(),
     );
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-        let hover_color = egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+        let hover_color = egui::Color32::from_rgba_premultiplied(0, 0, 255, 80);
         ui.painter().rect_filled(response.rect, 4.0, hover_color);
     }
     if response.clicked() {
@@ -637,7 +645,8 @@ impl eframe::App for LogViewerApp {
                     .fixed_pos(drop_pos)
                     .order(egui::Order::Foreground)
                     .show(ui.ctx(), |ui| {
-                        ui.set_min_width(200.0);
+                        ui.set_max_width(150.0);
+                        ui.set_min_width(150.0);
                         let mf = egui::Frame::menu(ui.style());
                         mf.show(ui, |ui| {
                             match menu {
@@ -658,7 +667,7 @@ impl eframe::App for LogViewerApp {
                                     let follow_label = if self.following {
                                         "Stop Following"
                                     } else {
-                                        "Follow (tail -f)"
+                                        "Follow"
                                     };
                                     let follow_shortcut = if self.keybind_state.enabled {
                                         "t"
@@ -718,7 +727,8 @@ impl eframe::App for LogViewerApp {
                         .fixed_pos(sub_pos)
                         .order(egui::Order::Foreground)
                         .show(ui.ctx(), |ui| {
-                            ui.set_min_width(160.0);
+                            ui.set_max_width(120.0);
+                            ui.set_min_width(120.0);
                             let mf = egui::Frame::menu(ui.style());
                             mf.show(ui, |ui| {
                                 let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
