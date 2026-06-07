@@ -11,12 +11,50 @@ use eframe::egui;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 // bring KeybindState into scope so we can use it without the module prefix.
 use keybinds::KeybindState;
 
 // Native file dialog for the Open menu action.
 use rfd;
+
+// File system watcher for tail -f (follow mode).
+use notify::{self, EventKind, RecursiveMode, Watcher};
+
+// ── Bundled fonts ───────────────────────────────────────────────────────────
+// DejaVu Sans Mono (Bitstream Vera-derived, ~336 KB) replaces Hack as the
+// primary monospace font because it has vastly better Unicode coverage
+// (including U+2713 CHECK MARK and many other symbols that log files commonly
+// contain).  Noto Emoji Regular (~409 KB) is registered as a further fallback
+// so that actual emoji codepoints resolve to glyphs instead of tofu.
+fn load_emoji_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let dejavu: &'static [u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let emoji: &'static [u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+    fonts.font_data.insert(
+        "dejavu".into(),
+        std::sync::Arc::new(egui::FontData::from_static(dejavu)),
+    );
+    fonts.font_data.insert(
+        "emoji".into(),
+        std::sync::Arc::new(egui::FontData::from_static(emoji)),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .clear();
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .extend(["dejavu".to_string(), "emoji".to_string()]);
+    ctx.set_fonts(fonts);
+}
 
 // Scroll source flags for the ScrollArea (disable drag-to-scroll).
 use eframe::egui::containers::scroll_area::ScrollSource;
@@ -62,6 +100,32 @@ struct LogViewerApp {
     // Set to true by keybinds (Ctrl+O in GUI mode, o in terminal mode)
     // to signal that a file dialog should be opened on the next frame.
     open_requested: bool,
+
+    // Whether "tail -f" follow mode is active. When true, the file is
+    // watched for changes and lines are reloaded on each modification.
+    following: bool,
+
+    // Thread-safe flag set by the file watcher callback when the file
+    // has been modified. Checked once per frame in ui().
+    file_changed: Arc<AtomicBool>,
+
+    // The active file watcher. Kept alive for the duration of follow mode.
+    // Dropped (set to None) when follow mode is turned off.
+    _watcher: Option<notify::RecommendedWatcher>,
+
+    // Set to true by the Tools menu or keybind (Ctrl+W / t) to toggle
+    // follow mode on the next frame. Checked at the top of ui() before
+    // any borrows of self.lines are active.
+    follow_toggled: bool,
+
+    // Monospace font size for the main canvas (log lines).
+    // Controlled via Tools → Font submenu. Only applied when the
+    // style override is set at the start of each frame.
+    font_size: f32,
+
+    // Set to true once the emoji font has been loaded into the egui context.
+    // Prevents redundant font-atlas rebuilds on every frame.
+    emoji_font_loaded: bool,
 }
 
 impl LogViewerApp {
@@ -95,11 +159,18 @@ impl LogViewerApp {
             current_match: 0,
             file_path: stored_path,
             open_requested: false,
+            following: false,
+            file_changed: Arc::new(AtomicBool::new(false)),
+            _watcher: None,
+            follow_toggled: false,
+            font_size: 14.0,
+            emoji_font_loaded: false,
         }
     }
 
     // Load a file into the viewer, replacing the current content.
     fn load_file(&mut self, path: &PathBuf) {
+        self.stop_following();
         let content = fs::read_to_string(path).unwrap_or_else(|err| {
             format!(
                 "Failed to open log file: {}\nError: {}",
@@ -112,6 +183,40 @@ impl LogViewerApp {
         self.search_query.clear();
         self.current_match = 0;
         self.scroll_offset = 0.0;
+    }
+
+    // Start watching the current file for changes (tail -f).
+    // Does nothing if no file is loaded or if already following.
+    fn start_following(&mut self) {
+        if self.following || self.file_path.is_none() {
+            return;
+        }
+
+        let path = self.file_path.as_ref().unwrap().clone();
+        let changed = self.file_changed.clone();
+
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        changed.store(true, Ordering::Relaxed);
+                    }
+                }
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+
+        if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+            self._watcher = Some(watcher);
+            self.following = true;
+        }
+    }
+
+    // Stop watching the current file. Does nothing if not following.
+    fn stop_following(&mut self) {
+        self._watcher = None;
+        self.following = false;
     }
 }
 
@@ -155,6 +260,14 @@ impl eframe::App for LogViewerApp {
         ui.ctx().set_visuals(visuals.clone());
         ui.style_mut().visuals = visuals;
 
+        // Override the monospace text style to respect the user's font size
+        // choice. This affects the main canvas (log lines); the search box
+        // and menu bar use their own explicit sizes.
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(self.font_size),
+        );
+
         // Render the mode-specific background for the entire app.
         // GUI mode uses an all-white background; terminal mode uses all-black.
         let frame_fill = if self.keybind_state.enabled {
@@ -163,6 +276,12 @@ impl eframe::App for LogViewerApp {
             egui::Color32::WHITE
         };
         let frame = egui::Frame::new().fill(frame_fill);
+
+        // Register an emoji font so Unicode emoji in log files render correctly.
+        if !self.emoji_font_loaded {
+            load_emoji_font(ui.ctx());
+            self.emoji_font_loaded = true;
+        }
 
         // Update the window title to show the currently loaded file (or just the app name).
         let title = if let Some(ref path) = self.file_path {
@@ -176,13 +295,42 @@ impl eframe::App for LogViewerApp {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
 
-        // GUI-mode keybinds: Ctrl+Q to quit, Ctrl+O to open a file.
+        // GUI-mode keybinds: Ctrl+Q to quit, Ctrl+O to open, Ctrl+W to follow.
         if !self.keybind_state.enabled {
             if ui.input(|i| i.key_pressed(egui::Key::Q) && i.modifiers.ctrl) {
                 std::process::exit(0);
             }
             if ui.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
                 self.open_requested = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::W) && i.modifiers.ctrl) {
+                self.follow_toggled = true;
+            }
+        }
+
+        // Handle deferred follow toggle (from GUI keybinds, Tools menu, or terminal t).
+        if self.follow_toggled {
+            self.follow_toggled = false;
+            if self.file_path.is_some() {
+                if self.following {
+                    self.stop_following();
+                } else {
+                    self.start_following();
+                }
+            }
+        }
+
+        // If following, check whether the file has changed and reload if so.
+        if self.following && self.file_changed.swap(false, Ordering::Relaxed) {
+            if let Some(ref path) = self.file_path.clone() {
+                let content = fs::read_to_string(path).unwrap_or_else(|err| {
+                    format!(
+                        "Failed to open log file: {}\nError: {}",
+                        path.display(),
+                        err
+                    )
+                });
+                self.lines = content.lines().map(|l| l.to_string()).collect();
             }
         }
 
@@ -204,16 +352,75 @@ impl eframe::App for LogViewerApp {
         frame.show(ui, |ui| {
             // --- Menu bar ---
             egui::MenuBar::new().ui(ui, |ui| {
+                // menu_item is a helper closure that renders one entry in a menu
+                // dropdown. It draws a label on the left and a shortcut hint on the
+                // right, and calls action when clicked.
+                let menu_item =
+                    |ui: &mut egui::Ui,
+                     label: &str,
+                     shortcut: &str,
+                     action: &mut dyn FnMut(&mut egui::Ui)| {
+                        let inner = ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(label).size(16.0));
+                            ui.add_space(48.0);
+                            ui.weak(egui::RichText::new(shortcut).size(14.0));
+                        });
+                        let response = ui.interact(
+                            inner.response.rect,
+                            inner.response.id.with(label),
+                            egui::Sense::click(),
+                        );
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                            let hover_color =
+                                egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+                            ui.painter().rect_filled(response.rect, 4.0, hover_color);
+                        }
+                        if response.clicked() {
+                            action(ui);
+                        }
+                    };
+
                 ui.menu_button(egui::RichText::new("File").size(16.0), |ui| {
-                    let menu_item =
-                        |ui: &mut egui::Ui,
-                         label: &str,
-                         shortcut: &str,
-                         action: &mut dyn FnMut(&mut egui::Ui)| {
+                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
+                        self.open_requested = true;
+                        ui.close();
+                    });
+
+                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
+                        std::process::exit(0);
+                    });
+                });
+
+                ui.menu_button(egui::RichText::new("Tools").size(16.0), |ui| {
+                    let follow_label = if self.following {
+                        "Stop Following"
+                    } else {
+                        "Follow (tail -f)"
+                    };
+                    let follow_shortcut = if self.keybind_state.enabled {
+                        "t"
+                    } else {
+                        "Ctrl+W"
+                    };
+                    menu_item(ui, follow_label, follow_shortcut, &mut |menu_ui| {
+                        self.follow_toggled = true;
+                        menu_ui.close();
+                    });
+
+                    ui.separator();
+
+                    ui.menu_button(egui::RichText::new("Font").size(16.0), |ui| {
+                        let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
+                        for &(size, label) in &sizes {
+                            let is_current = (self.font_size - size).abs() < 0.01;
                             let inner = ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(label).size(16.0));
                                 ui.add_space(48.0);
-                                ui.weak(egui::RichText::new(shortcut).size(14.0));
+                                ui.weak(
+                                    egui::RichText::new(if is_current { "*" } else { "" })
+                                        .size(14.0),
+                                );
                             });
                             let response = ui.interact(
                                 inner.response.rect,
@@ -227,19 +434,12 @@ impl eframe::App for LogViewerApp {
                                 ui.painter().rect_filled(response.rect, 4.0, hover_color);
                             }
                             if response.clicked() {
-                                action(ui);
+                                self.font_size = size;
+                                ui.close();
                             }
-                        };
-
-                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
-                        self.open_requested = true;
-                        ui.close();
+                        }
                     });
-
-                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
-                        std::process::exit(0);
-                    });
-                })
+                });
             });
 
             // --- Header bar ---
@@ -300,6 +500,13 @@ impl eframe::App for LogViewerApp {
                         .clicked()
                     {
                         self.keybind_state.enabled = !self.keybind_state.enabled;
+                    }
+                    if self.following {
+                        ui.label(
+                            egui::RichText::new(" ● Follow")
+                                .size(14.0)
+                                .color(egui::Color32::LIGHT_GREEN),
+                        );
                     }
                 });
 
@@ -407,6 +614,7 @@ impl eframe::App for LogViewerApp {
             // process_keybinds() returns true if q was pressed and we should quit.
             let mut next_match = false;
             let mut prev_match = false;
+            let mut follow_toggled = false;
             let should_quit = keybinds::process_keybinds(
                 ui.ctx(),
                 &mut self.keybind_state,
@@ -418,6 +626,7 @@ impl eframe::App for LogViewerApp {
                 &mut next_match,
                 &mut prev_match,
                 &mut self.open_requested,
+                &mut follow_toggled,
             );
 
             // Handle n/N from terminal-mode keybinds.
@@ -442,9 +651,9 @@ impl eframe::App for LogViewerApp {
                 self.scroll_offset = line_idx as f32 * row_height;
             }
 
+            self.follow_toggled = self.follow_toggled || follow_toggled;
+
             if should_quit {
-                // eframe 0.34 does not expose a close() method on Frame, so we
-                // exit immediately when q is pressed in terminal keybind mode.
                 std::process::exit(0);
             }
 
@@ -491,7 +700,7 @@ impl eframe::App for LogViewerApp {
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             let mut scroll_area = egui::ScrollArea::vertical()
                 .auto_shrink(false)
-                .stick_to_bottom(false)
+                .stick_to_bottom(self.following)
                 .scroll_source(ScrollSource::SCROLL_BAR | ScrollSource::MOUSE_WHEEL);
             if self.scroll_offset != 0.0 {
                 // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
