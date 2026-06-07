@@ -55,6 +55,8 @@ impl KeybindState {
 //                          main.rs reads this after the call and rewinds current_match.
 //   open_requested       — set to true when the user presses o (open file).
 //                          main.rs reads this after the call and opens the file dialog.
+//   follow_toggled       — set to true when the user presses t (toggle follow mode).
+//                          main.rs reads this after the call and toggles tail -f.
 //
 // Returns true if the application should quit (q was pressed), false otherwise.
 // main.rs checks this return value and calls frame.close() accordingly.
@@ -69,6 +71,7 @@ pub fn process_keybinds(
     next_match_requested: &mut bool,
     prev_match_requested: &mut bool,
     open_requested: &mut bool,
+    follow_toggled: &mut bool,
 ) -> bool {
     // If keybind mode is not enabled, do nothing and return early.
     // This is important — we must not intercept keypresses when the user
@@ -143,6 +146,12 @@ pub fn process_keybinds(
         // Opens a native file dialog to select a log file.
         if input.key_pressed(egui::Key::O) {
             *open_requested = true;
+        }
+
+        // --- t: toggle follow (tail -f) mode ---
+        // Starts or stops watching the file for live updates.
+        if input.key_pressed(egui::Key::T) && !input.modifiers.shift {
+            *follow_toggled = true;
         }
 
         // --- n: next search match ---
