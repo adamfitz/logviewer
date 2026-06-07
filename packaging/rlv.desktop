@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=rlv
+Comment=GUI log viewer written in Rust
+Exec=rlv
+Icon=rlv
+Terminal=false
+Type=Application
+Categories=Utility;

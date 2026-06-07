@@ -32,3 +32,6 @@ arboard = "3"
 
 # Native file dialogs
 rfd = "0.15"
+
+# PNG decoding for window icon
+image = "0.25"

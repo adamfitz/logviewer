@@ -1,0 +1,8 @@
+Package: rlv
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Adam adam@networknoob.net
+Description: GUI log viewer written in rust
+ rust log viewer

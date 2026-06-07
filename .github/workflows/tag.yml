@@ -1,0 +1,81 @@
+name: Increment Tag on Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # IMPORTANT: use PR source branch, not GITHUB_REF
+      - name: Get branch name
+        id: branch
+        run: |
+          echo "branch_name=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch_name }}"
+          echo "Source branch: $BRANCH"
+
+          if [[ "$BRANCH" == major/* || "$BRANCH" == release/* ]]; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+
+          elif [[ "$BRANCH" == minor/* || "$BRANCH" == feature/* ]]; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+
+          elif [[ "$BRANCH" == fix/* || "$BRANCH" == bugfix/* ]]; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get latest tag
+        id: tag
+        run: |
+          git fetch --tags
+          latest=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate next version
+        id: next
+        run: |
+          latest="${{ steps.tag.outputs.latest }}"
+          bump="${{ steps.bump.outputs.bump }}"
+
+          major=$(echo "$latest" | cut -d. -f1 | tr -d v)
+          minor=$(echo "$latest" | cut -d. -f2)
+          patch=$(echo "$latest" | cut -d. -f3)
+
+          if [[ "$bump" == "major" ]]; then
+            major=$((major+1)); minor=0; patch=0
+          elif [[ "$bump" == "minor" ]]; then
+            minor=$((minor+1)); patch=0
+          else
+            patch=$((patch+1))
+          fi
+
+          new="v$major.$minor.$patch"
+          echo "new_tag=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag "${{ steps.next.outputs.new_tag }}"
+          git push origin "${{ steps.next.outputs.new_tag }}"

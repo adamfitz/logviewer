@@ -1,0 +1,88 @@
+name: Build and Release Debian Package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-release-deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          CLEAN_VERSION=${VERSION#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "clean_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dpkg-dev \
+            gcc \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev
+
+      - name: Build application
+        run: cargo build --release
+
+      - name: Prepare rootfs
+        run: |
+          mkdir -p rootfs/DEBIAN
+          mkdir -p rootfs/usr/bin
+          mkdir -p rootfs/usr/share/applications
+          mkdir -p rootfs/usr/share/icons/hicolor/256x256/apps
+
+          sed "s/@VERSION@/${{ steps.version.outputs.clean_version }}/" \
+            packaging/DEBIAN/control.lin > rootfs/DEBIAN/control
+
+          cp packaging/rlv.desktop \
+            rootfs/usr/share/applications/rlv.desktop
+
+          cp assets/icon.png \
+            rootfs/usr/share/icons/hicolor/256x256/apps/rlv.png
+
+          cp target/release/rlv \
+            rootfs/usr/bin/rlv
+
+      - name: Fix permissions
+        run: |
+          chmod 755 rootfs/usr/bin/rlv
+          chmod 644 rootfs/usr/share/applications/rlv.desktop
+          chmod 644 rootfs/usr/share/icons/hicolor/256x256/apps/rlv.png
+          chmod 755 rootfs/DEBIAN
+
+      - name: Build deb package
+        run: |
+          mkdir -p builds
+          dpkg-deb --build rootfs \
+            builds/rlv_${{ steps.version.outputs.clean_version }}_amd64.deb
+
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            builds/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
