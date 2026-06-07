@@ -7,6 +7,7 @@
 // To add or change a keybind, this is the only file that needs to be touched.
 
 use eframe::egui;
+use std::time::Instant;
 
 // The scroll speed in pixels for single-line movements (j/k).
 // This matches a typical terminal line height and feels natural for log navigation.
@@ -24,13 +25,19 @@ pub struct KeybindState {
     // When false, the keyboard behaves normally (egui handles text input etc.).
     // When true, single keypresses are intercepted for vi/less-style navigation.
     pub enabled: bool,
+
+    // Timestamp of the last 'y' key press, used to detect 'yy' (yank) double-tap.
+    last_y_press: Option<Instant>,
 }
 
 impl KeybindState {
     // Constructor — keybind mode starts disabled so the app opens in normal GUI mode.
     // The user opts in via a button or menu item in main.rs.
     pub fn new() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            last_y_press: None,
+        }
     }
 }
 
@@ -81,6 +88,7 @@ pub fn process_keybinds(
     reverse_search: &mut bool,
     go_to_top: &mut bool,
     go_to_bottom: &mut bool,
+    yank_requested: &mut bool,
 ) -> bool {
     // If keybind mode is not enabled, do nothing and return early.
     // This is important — we must not intercept keypresses when the user
@@ -179,6 +187,19 @@ pub fn process_keybinds(
         // Goes back to the previous search result (like N in vim/less).
         if input.key_pressed(egui::Key::N) && input.modifiers.shift {
             *prev_match_requested = true;
+        }
+
+        // --- yy: yank (copy) current line to clipboard ---
+        // Double-tap y within 500ms triggers a yank.
+        if input.key_pressed(egui::Key::Y) {
+            let now = Instant::now();
+            if state
+                .last_y_press
+                .is_some_and(|t| now.duration_since(t).as_millis() < 500)
+            {
+                *yank_requested = true;
+            }
+            state.last_y_press = Some(now);
         }
     });
 

@@ -10,6 +10,7 @@ use std::sync::{
     Arc,
 };
 
+use arboard::Clipboard;
 use fancy_regex::Regex;
 use keybinds::KeybindState;
 use notify::{self, EventKind, RecursiveMode, Watcher};
@@ -135,6 +136,9 @@ struct LogViewerApp {
     // Set when a reverse search is submitted; consumed on search completion
     // to jump to the last match instead of the first.
     pending_reverse_jump: bool,
+
+    // Set when yy is detected in terminal mode; consumed to copy current line.
+    yank_requested: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -174,6 +178,7 @@ impl LogViewerApp {
             search_error: None,
             reverse_search: false,
             pending_reverse_jump: false,
+            yank_requested: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -290,6 +295,7 @@ impl LogViewerApp {
         self.search_regex = None;
         self.pending_reverse_jump = false;
         self.reverse_search = false;
+        self.yank_requested = false;
     }
 
     fn start_following(&mut self) {
@@ -497,6 +503,7 @@ impl eframe::App for LogViewerApp {
                         self.search_regex = None;
                         self.pending_reverse_jump = false;
                         self.reverse_search = false;
+                        self.yank_requested = false;
                     }
                 }
             }
@@ -785,6 +792,7 @@ impl eframe::App for LogViewerApp {
                 &mut self.reverse_search,
                 &mut go_to_top,
                 &mut go_to_bottom,
+                &mut self.yank_requested,
             );
 
             if !self.search_matches.is_empty() {
@@ -822,6 +830,41 @@ impl eframe::App for LogViewerApp {
                 if !go_to_top && !go_to_bottom {
                     let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
+                }
+            }
+
+            if self.yank_requested {
+                self.yank_requested = false;
+                if let (Some(mmap), line_offsets) = (self.mmap.as_ref(), &self.line_offsets) {
+                    let total = if has_query {
+                        self.search_results.len()
+                    } else {
+                        self.total_lines
+                    };
+                    let top_line = ((self.scroll_offset / row_height).round() as usize)
+                        .min(total.saturating_sub(1));
+                    if total > 0 {
+                        let line_idx = if has_query {
+                            self.search_results[top_line]
+                        } else {
+                            top_line
+                        };
+                        let start = line_offsets[line_idx];
+                        let end = if line_idx + 1 < self.total_lines {
+                            line_offsets[line_idx + 1] - 1
+                        } else {
+                            let raw_end = mmap.len();
+                            if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
+                                raw_end - 1
+                            } else {
+                                raw_end
+                            }
+                        };
+                        let line_text = String::from_utf8_lossy(&mmap[start..end]).to_string();
+                        if let Ok(mut cb) = Clipboard::new() {
+                            let _ = cb.set_text(line_text);
+                        }
+                    }
                 }
             }
 
@@ -1047,7 +1090,7 @@ impl eframe::App for LogViewerApp {
                             let line_bytes = &mmap[start..end];
                             let line = String::from_utf8_lossy(line_bytes);
 
-                            ui.horizontal(|ui| {
+                            let row_response = ui.horizontal(|ui| {
                                 ui.add_sized(
                                     egui::vec2(72.0, row_height),
                                     egui::Label::new(
@@ -1060,7 +1103,8 @@ impl eframe::App for LogViewerApp {
                                         egui::Label::new(
                                             egui::RichText::new(line.as_ref()).monospace(),
                                         )
-                                        .wrap(),
+                                        .wrap()
+                                        .selectable(true),
                                     );
                                 } else {
                                     let mut job = egui::text::LayoutJob::default();
@@ -1092,9 +1136,15 @@ impl eframe::App for LogViewerApp {
                                     if prev_end < line_str.len() {
                                         job.append(&line_str[prev_end..], 0.0, normal_fmt.clone());
                                     }
-                                    ui.add(egui::Label::new(job).wrap());
+                                    ui.add(egui::Label::new(job).wrap().selectable(true));
                                 }
                             });
+                            if row_response.response.secondary_clicked() {
+                                let line_text = line.to_string();
+                                if let Ok(mut cb) = Clipboard::new() {
+                                    let _ = cb.set_text(line_text);
+                                }
+                            }
                         }
                     });
                 }

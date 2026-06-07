@@ -23,13 +23,8 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 - **File menu** — File > Open (native file dialog) and File > Quit; Tools > Follow, Tools > Font (Small/Medium/Large)
 - **Optional CLI argument** — Start without a file to see the welcome screen, or pass a path to open directly
 - **Dynamic window title** — Shows the current file name in the title bar
+- **Text selection + clipboard copy** — Text in log lines is selectable; right-click on any line copies it to the system clipboard. In terminal mode, `yy` yanks (copies) the current line.
 - **Bundled emoji font** — DejaVu Sans Mono (primary, broad Unicode coverage) + Noto Emoji (fallback for emoji glyphs)
-
-### Planned / Not Yet Implemented
-
-| Feature | Dependencies | Notes |
-|---|---|---|---|
-| **Text selection + clipboard copy** | `arboard` | Ctrl+C to copy selected text to system clipboard |
 
 ## Usage
 
@@ -52,6 +47,8 @@ logviewer <path/to/logfile.log>  # open directly
 | `Shift+Enter` | Search focused | Submit query / Previous match |
 | `Ctrl+Down` | Anywhere | Next match (if search active) |
 | `Ctrl+Up` | Anywhere | Previous match (if search active) |
+| `Ctrl+C` | Anywhere | Copy selected text |
+| Right-click | On a line | Copy that line to clipboard |
 
 #### Terminal Mode (vim/less-style)
 
@@ -68,6 +65,7 @@ Toggle on via the **"Mode: Terminal (vim/less)"** button in the top bar.
 | `/` | Anywhere | Focus search box (forward) |
 | `?` | Anywhere | Focus search box (reverse) |
 | `o` | Anywhere | Open file |
+| `yy` (double-tap `y`) | Anywhere | Yank (copy) current line to clipboard |
 | `t` | Anywhere | Toggle follow (tail -f) |
 | `q` | Anywhere | Quit |
 | `Enter` | Search focused | Next match |
