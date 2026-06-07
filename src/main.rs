@@ -518,6 +518,10 @@ impl eframe::App for LogViewerApp {
             if ui.input(|i| i.key_pressed(egui::Key::W) && i.modifiers.ctrl) {
                 self.follow_toggled = true;
             }
+            if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl) {
+                self.open_menu = Some(1);
+                self.font_submenu = true;
+            }
         }
 
         if self.follow_toggled {
@@ -626,6 +630,9 @@ impl eframe::App for LogViewerApp {
                 }
             });
 
+            if new_open_menu.is_none() {
+                self.font_submenu = false;
+            }
             self.open_menu = new_open_menu;
 
             // Dropdown for the open menu
@@ -663,7 +670,6 @@ impl eframe::App for LogViewerApp {
                                 1 => {
                                     // Tools menu
                                     submenu_was_open = self.font_submenu;
-                                    self.font_submenu = false;
                                     let follow_label = if self.following {
                                         "Stop Following"
                                     } else {
@@ -935,6 +941,13 @@ impl eframe::App for LogViewerApp {
                 &mut go_to_bottom,
                 &mut self.yank_requested,
             );
+
+            if self.keybind_state.enabled
+                && ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl)
+            {
+                self.open_menu = Some(1);
+                self.font_submenu = true;
+            }
 
             if !self.search_matches.is_empty() {
                 if go_to_top {

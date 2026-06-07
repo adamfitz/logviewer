@@ -20,7 +20,8 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 - **Dark / light themes** — Terminal mode uses dark theme with black background; GUI mode uses light theme with white background
 - **Tail -f live follow** — Watch the file for changes and stream new lines in real time (toggle via Tools menu, Ctrl+W, or `t`)
 - **Compressed file support** — Open `.gz` and `.tar.gz` files; decompressed to temp files then memory-mapped
-- **File menu** — File > Open (native file dialog) and File > Quit; Tools > Follow, Tools > Font (Small/Medium/Large)
+- **Hover-to-open menus** — File and Tools dropdowns open on hover with click-outside-to-close; menu items have full-width blue hover highlight with right-aligned keybinds
+- **Font size adjustment** — Tools > Font opens a flyout submenu with Small (14px), Medium (18px), Large (22px); selected size marked with `*`; accessible via Ctrl+S in both GUI and terminal modes
 - **Optional CLI argument** — Start without a file to see the welcome screen, or pass a path to open directly
 - **Dynamic window title** — Shows the current file name in the title bar
 - **Text selection + clipboard copy** — Text in log lines is selectable; right-click on any line copies it to the system clipboard. In terminal mode, `yy` yanks (copies) the current line.
@@ -30,7 +31,8 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 
 ```
 logviewer                         # start empty, use File > Open
-
+logviewer /var/log/syslog         # open a file directly
+logviewer logfile.gz              # open a compressed file (.gz / .tar.gz)
 ```
 
 ### Keybinds
@@ -41,7 +43,8 @@ logviewer                         # start empty, use File > Open
 |---|---|---|
 | `Ctrl+O` | Anywhere | Open file |
 | `Ctrl+Q` | Anywhere | Quit |
-| `Ctrl+W` | Anywhere | Toggle follow (tail -f) |
+| `Ctrl+W` | Anywhere | Toggle follow |
+| `Ctrl+S` | Anywhere | Open font size menu |
 | `Ctrl+F` | Anywhere | Focus search box |
 | `Enter` | Search focused | Submit query / Next match |
 | `Shift+Enter` | Search focused | Submit query / Previous match |
@@ -66,7 +69,8 @@ Toggle on via the **"Mode: Terminal (vim/less)"** button in the top bar.
 | `?` | Anywhere | Focus search box (reverse) |
 | `o` | Anywhere | Open file |
 | `yy` (double-tap `y`) | Anywhere | Yank (copy) current line to clipboard |
-| `t` | Anywhere | Toggle follow (tail -f) |
+| `t` | Anywhere | Toggle follow |
+| `Ctrl+S` | Anywhere | Open font size menu |
 | `q` | Anywhere | Quit |
 | `Enter` | Search focused | Next match |
 | `Shift+Enter` | Search focused | Previous match |
