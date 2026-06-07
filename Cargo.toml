@@ -24,4 +24,5 @@ tar = "0.4"
 # Clipboard (Ctrl+C copy)
 arboard = "3"
 
-# Native file o
+# Native file dialogs
+rfd = "0.15"
