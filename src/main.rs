@@ -86,6 +86,11 @@ struct LogViewerApp {
     // follow mode on the next frame. Checked at the top of ui() before
     // any borrows of self.lines are active.
     follow_toggled: bool,
+
+    // Monospace font size for the main canvas (log lines).
+    // Controlled via Tools → Font submenu. Only applied when the
+    // style override is set at the start of each frame.
+    font_size: f32,
 }
 
 impl LogViewerApp {
@@ -123,6 +128,7 @@ impl LogViewerApp {
             file_changed: Arc::new(AtomicBool::new(false)),
             _watcher: None,
             follow_toggled: false,
+            font_size: 14.0,
         }
     }
 
@@ -217,6 +223,14 @@ impl eframe::App for LogViewerApp {
 
         ui.ctx().set_visuals(visuals.clone());
         ui.style_mut().visuals = visuals;
+
+        // Override the monospace text style to respect the user's font size
+        // choice. This affects the main canvas (log lines); the search box
+        // and menu bar use their own explicit sizes.
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(self.font_size),
+        );
 
         // Render the mode-specific background for the entire app.
         // GUI mode uses an all-white background; terminal mode uses all-black.
@@ -350,6 +364,38 @@ impl eframe::App for LogViewerApp {
                     menu_item(ui, follow_label, follow_shortcut, &mut |menu_ui| {
                         self.follow_toggled = true;
                         menu_ui.close();
+                    });
+
+                    ui.separator();
+
+                    ui.menu_button(egui::RichText::new("Font").size(16.0), |ui| {
+                        let sizes = [(14.0f32, "Small"), (18.0, "Medium"), (22.0, "Large")];
+                        for &(size, label) in &sizes {
+                            let is_current = (self.font_size - size).abs() < 0.01;
+                            let inner = ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).size(16.0));
+                                ui.add_space(48.0);
+                                ui.weak(
+                                    egui::RichText::new(if is_current { "*" } else { "" })
+                                        .size(14.0),
+                                );
+                            });
+                            let response = ui.interact(
+                                inner.response.rect,
+                                inner.response.id.with(label),
+                                egui::Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                let hover_color =
+                                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+                                ui.painter().rect_filled(response.rect, 4.0, hover_color);
+                            }
+                            if response.clicked() {
+                                self.font_size = size;
+                                ui.close();
+                            }
+                        }
                     });
                 });
             });
