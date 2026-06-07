@@ -145,6 +145,8 @@ struct LogViewerApp {
 
     // True when the Font submenu in Tools is open (hovered).
     font_submenu: bool,
+
+    show_about: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -187,6 +189,7 @@ impl LogViewerApp {
             yank_requested: false,
             open_menu: None,
             font_submenu: false,
+            show_about: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -498,11 +501,11 @@ impl eframe::App for LogViewerApp {
 
         let title = if let Some(ref path) = self.file_path {
             format!(
-                "rlv - {}",
+                "Rust Log Viewer - {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             )
         } else {
-            "rlv".to_string()
+            "Rust Log Viewer".to_string()
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -663,6 +666,12 @@ impl eframe::App for LogViewerApp {
                                         self.open_requested = true;
                                         self.open_menu = None;
                                     });
+                                    ui.separator();
+                                    menu_drop_item(ui, "About", "", &mut || {
+                                        self.show_about = true;
+                                        self.open_menu = None;
+                                    });
+                                    ui.separator();
                                     menu_drop_item(ui, "Quit", "Ctrl+Q", &mut || {
                                         std::process::exit(0);
                                     });
@@ -759,6 +768,26 @@ impl eframe::App for LogViewerApp {
                         self.font_submenu = true;
                     }
                 }
+            }
+
+            // --- About dialog ---
+            if self.show_about {
+                egui::Window::new("About")
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading("Rust Log Viewer");
+                            ui.label(format!("Version: {}", env!("GIT_TAG")));
+                            ui.label(format!("Build: {}", env!("GIT_COMMIT")));
+                            ui.hyperlink("https://github.com/adamfitz/rlv");
+                        });
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            self.show_about = false;
+                        }
+                    });
             }
 
             // --- Header bar ---
@@ -1338,7 +1367,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "rlv",
+        "Rust Log Viewer",
         options,
         Box::new(|_cc| Ok(Box::new(LogViewerApp::new(file_path)))),
     )
