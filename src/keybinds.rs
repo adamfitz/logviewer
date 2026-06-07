@@ -53,6 +53,8 @@ impl KeybindState {
 //                          main.rs reads this after the call and advances current_match.
 //   prev_match_requested — set to true when the user presses N/shift+n (previous match).
 //                          main.rs reads this after the call and rewinds current_match.
+//   open_requested       — set to true when the user presses o (open file).
+//                          main.rs reads this after the call and opens the file dialog.
 //
 // Returns true if the application should quit (q was pressed), false otherwise.
 // main.rs checks this return value and calls frame.close() accordingly.
@@ -66,6 +68,7 @@ pub fn process_keybinds(
     search_focus_requested: &mut bool,
     next_match_requested: &mut bool,
     prev_match_requested: &mut bool,
+    open_requested: &mut bool,
 ) -> bool {
     // If keybind mode is not enabled, do nothing and return early.
     // This is important — we must not intercept keypresses when the user
@@ -134,6 +137,12 @@ pub fn process_keybinds(
             // Requesting this as a scroll offset guarantees we land at the bottom
             // after egui's clamping, regardless of actual viewport height.
             *scroll_delta = (total_rows as f32) * row_height;
+        }
+
+        // --- o: open file ---
+        // Opens a native file dialog to select a log file.
+        if input.key_pressed(egui::Key::O) {
+            *open_requested = true;
         }
 
         // --- n: next search match ---

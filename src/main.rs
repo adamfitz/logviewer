@@ -15,6 +15,9 @@ use std::path::PathBuf;
 // bring KeybindState into scope so we can use it without the module prefix.
 use keybinds::KeybindState;
 
+// Native file dialog for the Open menu action.
+use rfd;
+
 // The application state struct. In egui's immediate-mode model, this struct is
 // the single source of truth — everything the UI needs to render a frame lives here.
 // Each frame, egui calls ui() and re-draws the entire interface from this state.
@@ -48,36 +51,38 @@ struct LogViewerApp {
 
     // Index into search_matches for the match to jump to on the next Enter press.
     current_match: usize,
+
+    // The path of the currently loaded file, if any.
+    // None means no file is loaded (app started without a CLI argument).
+    file_path: Option<PathBuf>,
+
+    // Set to true by keybinds (Ctrl+O in GUI mode, o in terminal mode)
+    // to signal that a file dialog should be opened on the next frame.
+    open_requested: bool,
 }
 
 impl LogViewerApp {
     // Associated constructor function (not a trait method).
     // Called once at startup to create the initial application state.
-    // Takes a reference to a PathBuf rather than a String to correctly handle
-    // cross-platform path representations (spaces, unicode, etc.).
-    fn new(file_path: &PathBuf) -> Self {
-        // Attempt to read the entire file into a String.
-        // unwrap_or_else means: if reading fails (file not found, permissions, etc.),
-        // instead of panicking we gracefully store an error message as the content.
-        // This way the window still opens and displays a readable error to the user.
-        let content = fs::read_to_string(file_path).unwrap_or_else(|err| {
-            format!(
-                "Failed to open log file: {}\nError: {}",
-                file_path.display(), // .display() gives a human-readable path string
-                err
+    // Takes an optional PathBuf — if None, the app starts with no file loaded.
+    fn new(file_path: Option<PathBuf>) -> Self {
+        // If a path was provided, attempt to load the file; otherwise start empty.
+        let (lines, stored_path) = if let Some(ref path) = file_path {
+            let content = fs::read_to_string(path).unwrap_or_else(|err| {
+                format!(
+                    "Failed to open log file: {}\nError: {}",
+                    path.display(),
+                    err
+                )
+            });
+            (
+                content.lines().map(|l| l.to_string()).collect(),
+                Some(path.clone()),
             )
-        });
+        } else {
+            (Vec::new(), None)
+        };
 
-        // Split the file content into individual owned lines.
-        // .lines() is a standard iterator that splits on \n and \r\n (handles both
-        // Unix and Windows line endings), and strips the newline characters themselves.
-        // .map(|l| l.to_string()) converts each &str slice into an owned String
-        // so the lines can outlive the temporary `content` String they came from.
-        // .collect() gathers the iterator into our Vec<String>.
-        let lines = content.lines().map(|l| l.to_string()).collect();
-
-        // Rust's struct initialization shorthand works when the field name matches
-        // the variable name. Here we also provide the remaining fields explicitly.
         Self {
             lines,
             keybind_state: KeybindState::new(),
@@ -85,7 +90,25 @@ impl LogViewerApp {
             search_focus_requested: false,
             scroll_offset: 0.0,
             current_match: 0,
+            file_path: stored_path,
+            open_requested: false,
         }
+    }
+
+    // Load a file into the viewer, replacing the current content.
+    fn load_file(&mut self, path: &PathBuf) {
+        let content = fs::read_to_string(path).unwrap_or_else(|err| {
+            format!(
+                "Failed to open log file: {}\nError: {}",
+                path.display(),
+                err
+            )
+        });
+        self.lines = content.lines().map(|l| l.to_string()).collect();
+        self.file_path = Some(path.clone());
+        self.search_query.clear();
+        self.current_match = 0;
+        self.scroll_offset = 0.0;
     }
 }
 
@@ -138,7 +161,84 @@ impl eframe::App for LogViewerApp {
         };
         let frame = egui::Frame::new().fill(frame_fill);
 
+        // Update the window title to show the currently loaded file (or just the app name).
+        let title = if let Some(ref path) = self.file_path {
+            format!(
+                "Log Viewer - {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
+        } else {
+            "Log Viewer".to_string()
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(title));
+
+        // GUI-mode keybinds: Ctrl+Q to quit, Ctrl+O to open a file.
+        if !self.keybind_state.enabled {
+            if ui.input(|i| i.key_pressed(egui::Key::Q) && i.modifiers.ctrl) {
+                std::process::exit(0);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
+                self.open_requested = true;
+            }
+        }
+
+        // If a file open was requested (from menu, Ctrl+O, or terminal o key),
+        // show the native file dialog on this frame.
+        if self.open_requested {
+            self.open_requested = false;
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter(
+                    "Log files",
+                    &["log", "txt", "out", "err", "stdout", "stderr"],
+                )
+                .pick_file()
+            {
+                self.load_file(&path);
+            }
+        }
+
         frame.show(ui, |ui| {
+            // --- Menu bar ---
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button(egui::RichText::new("File").size(16.0), |ui| {
+                    let menu_item =
+                        |ui: &mut egui::Ui,
+                         label: &str,
+                         shortcut: &str,
+                         action: &mut dyn FnMut(&mut egui::Ui)| {
+                            let inner = ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).size(16.0));
+                                ui.add_space(48.0);
+                                ui.weak(egui::RichText::new(shortcut).size(14.0));
+                            });
+                            let response = ui.interact(
+                                inner.response.rect,
+                                inner.response.id.with(label),
+                                egui::Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                let hover_color =
+                                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+                                ui.painter().rect_filled(response.rect, 4.0, hover_color);
+                            }
+                            if response.clicked() {
+                                action(ui);
+                            }
+                        };
+
+                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
+                        self.open_requested = true;
+                        ui.close();
+                    });
+
+                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
+                        std::process::exit(0);
+                    });
+                })
+            });
+
             // --- Header bar ---
             // A compact horizontal strip containing the search label, search input,
             // and mode toggle button. All elements share a consistent height so they
@@ -314,6 +414,7 @@ impl eframe::App for LogViewerApp {
                 &mut self.search_focus_requested,
                 &mut next_match,
                 &mut prev_match,
+                &mut self.open_requested,
             );
 
             // Handle n/N from terminal-mode keybinds.
@@ -441,44 +542,77 @@ impl eframe::App for LogViewerApp {
                 ..Default::default()
             };
 
-            let query = &self.search_query;
-            scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                let range = row_range.clone();
-                for (rel_fi, &(index, line)) in filtered_lines[range].iter().enumerate() {
-                    let fi = row_range.start + rel_fi;
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            egui::vec2(72.0, row_height),
-                            egui::Label::new(
-                                egui::RichText::new(format!("{:>6}", index + 1)).monospace(),
-                            ),
+            if self.lines.is_empty() && self.file_path.is_none() {
+                // Empty state — fill the entire available area with the
+                // correct background colour and centre the welcome text.
+                let fill_rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                    let content_height = 60.0;
+                    let top_padding = ((fill_rect.height() - content_height) / 2.0).max(0.0);
+                    ui.add_space(top_padding);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Welcome to Log Viewer")
+                                .size(28.0)
+                                .color(normal_color)
+                                .monospace(),
                         );
-                        if query.is_empty() {
-                            ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
-                        } else {
-                            let mut job = egui::text::LayoutJob::default();
-                            let mut start = 0;
-                            while let Some(pos) = line[start..].find(query) {
-                                let abs_pos = start + pos;
-                                if abs_pos > start {
-                                    job.append(&line[start..abs_pos], 0.0, normal_fmt.clone());
-                                }
-                                let is_current = search_matches
-                                    .get(self.current_match)
-                                    .map(|&(cm_fi, cm_off)| cm_fi == fi && cm_off == abs_pos)
-                                    .unwrap_or(false);
-                                let fmt = if is_current { &current_fmt } else { &match_fmt };
-                                job.append(&line[abs_pos..abs_pos + query.len()], 0.0, fmt.clone());
-                                start = abs_pos + query.len();
-                            }
-                            if start < line.len() {
-                                job.append(&line[start..], 0.0, normal_fmt.clone());
-                            }
-                            ui.add(egui::Label::new(job).wrap());
-                        }
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Use File > Open or Ctrl+O to open a log file")
+                                .size(16.0)
+                                .color(normal_color)
+                                .monospace(),
+                        );
                     });
-                }
-            });
+                });
+            } else {
+                let query = &self.search_query;
+                scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+                    let range = row_range.clone();
+                    for (rel_fi, &(index, line)) in filtered_lines[range].iter().enumerate() {
+                        let fi = row_range.start + rel_fi;
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                egui::vec2(72.0, row_height),
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{:>6}", index + 1)).monospace(),
+                                ),
+                            );
+                            if query.is_empty() {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(line).monospace()).wrap(),
+                                );
+                            } else {
+                                let mut job = egui::text::LayoutJob::default();
+                                let mut start = 0;
+                                while let Some(pos) = line[start..].find(query) {
+                                    let abs_pos = start + pos;
+                                    if abs_pos > start {
+                                        job.append(&line[start..abs_pos], 0.0, normal_fmt.clone());
+                                    }
+                                    let is_current = search_matches
+                                        .get(self.current_match)
+                                        .map(|&(cm_fi, cm_off)| cm_fi == fi && cm_off == abs_pos)
+                                        .unwrap_or(false);
+                                    let fmt = if is_current { &current_fmt } else { &match_fmt };
+                                    job.append(
+                                        &line[abs_pos..abs_pos + query.len()],
+                                        0.0,
+                                        fmt.clone(),
+                                    );
+                                    start = abs_pos + query.len();
+                                }
+                                if start < line.len() {
+                                    job.append(&line[start..], 0.0, normal_fmt.clone());
+                                }
+                                ui.add(egui::Label::new(job).wrap());
+                            }
+                        });
+                    }
+                });
+            }
         });
     }
 }
@@ -492,21 +626,14 @@ fn main() -> Result<(), eframe::Error> {
     // args[1] onwards are the user-supplied arguments.
     let args: Vec<String> = env::args().collect();
 
-    // Validate that the user provided at least one argument (the log file path).
-    // args.len() < 2 means only args[0] (the binary name) exists — no file was given.
-    if args.len() < 2 {
-        // Print a usage hint to stderr (not stdout) — stderr is the correct stream
-        // for error messages and diagnostics, stdout is for program output.
-        eprintln!("Usage: {} <path/to/logfile.log>", args[0]);
-        // Exit with code 1 to signal failure to the calling shell or parent process.
-        // (Exit code 0 = success, anything else = failure by Unix convention.)
-        std::process::exit(1);
-    }
-
-    // Convert the raw argument string into a PathBuf.
-    // PathBuf is Rust's owned, mutable path type — it handles OS-specific separators
-    // and is required by fs::read_to_string and other std::fs functions.
-    let file_path = PathBuf::from(&args[1]);
+    // The file path argument is optional — if provided, open it directly;
+    // otherwise start with an empty viewer and let the user open a file
+    // via the File menu or Ctrl+O.
+    let file_path = if args.len() > 1 {
+        Some(PathBuf::from(&args[1]))
+    } else {
+        None
+    };
 
     // Configure the native window options before creating it.
     // NativeOptions wraps everything eframe needs to initialise the OS window.
@@ -534,7 +661,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Log Viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(LogViewerApp::new(&file_path)))),
+        Box::new(|_cc| Ok(Box::new(LogViewerApp::new(file_path)))),
     )
     // run_native returns Result<(), eframe::Error>, which we propagate directly
     // to main's return type via the implicit return (no semicolon).
