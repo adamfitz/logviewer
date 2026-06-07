@@ -202,23 +202,39 @@ impl eframe::App for LogViewerApp {
             // --- Menu bar ---
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(egui::RichText::new("File").size(16.0), |ui| {
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("Open...   Ctrl+O").size(16.0),
-                        ))
-                        .clicked()
-                    {
+                    let menu_item =
+                        |ui: &mut egui::Ui,
+                         label: &str,
+                         shortcut: &str,
+                         action: &mut dyn FnMut(&mut egui::Ui)| {
+                            let inner = ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).size(16.0));
+                                ui.add_space(48.0);
+                                ui.weak(egui::RichText::new(shortcut).size(14.0));
+                            });
+                            let response = ui.interact(
+                                inner.response.rect,
+                                inner.response.id.with(label),
+                                egui::Sense::click(),
+                            );
+                            if response.hovered() {
+                                let hover_color =
+                                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 60);
+                                ui.painter().rect_filled(response.rect, 4.0, hover_color);
+                            }
+                            if response.clicked() {
+                                action(ui);
+                            }
+                        };
+
+                    menu_item(ui, "Open...", "Ctrl+O", &mut |ui| {
                         self.open_requested = true;
                         ui.close();
-                    }
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("Quit   Ctrl+Q").size(16.0),
-                        ))
-                        .clicked()
-                    {
+                    });
+
+                    menu_item(ui, "Quit", "Ctrl+Q", &mut |_ui| {
                         std::process::exit(0);
-                    }
+                    });
                 })
             });
 
