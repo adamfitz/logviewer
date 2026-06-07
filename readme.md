@@ -69,3 +69,15 @@ Toggle on via the **"Mode: Terminal (vim/less)"** button in the top bar.
 | `Shift+Enter` | Search focused | Previous match |
 | `n` | Search not focused | Next match |
 | `N` (Shift+n) | Search not focused | Previous match |
+
+## Acknowledgments
+
+This application bundles the following open-source fonts:
+
+- **DejaVu Sans Mono** — Copyright © 2003 Bitstream, Inc.  
+  DejaVu changes are in the public domain.  
+  https://dejavu-fonts.github.io/
+
+- **Noto Emoji** — Copyright © 2013 Google Inc.  
+  Licensed under the SIL Open Font License, Version 1.1.  
+  https://fonts.google.com/noto

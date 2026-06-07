@@ -25,6 +25,37 @@ use rfd;
 // File system watcher for tail -f (follow mode).
 use notify::{self, EventKind, RecursiveMode, Watcher};
 
+// ── Bundled fonts ───────────────────────────────────────────────────────────
+// DejaVu Sans Mono (Bitstream Vera-derived, ~336 KB) replaces Hack as the
+// primary monospace font because it has vastly better Unicode coverage
+// (including U+2713 CHECK MARK and many other symbols that log files commonly
+// contain).  Noto Emoji Regular (~409 KB) is registered as a further fallback
+// so that actual emoji codepoints resolve to glyphs instead of tofu.
+fn load_emoji_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let dejavu: &'static [u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let emoji: &'static [u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+    fonts.font_data.insert(
+        "dejavu".into(),
+        std::sync::Arc::new(egui::FontData::from_static(dejavu)),
+    );
+    fonts.font_data.insert(
+        "emoji".into(),
+        std::sync::Arc::new(egui::FontData::from_static(emoji)),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .clear();
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .extend(["dejavu".to_string(), "emoji".to_string()]);
+    ctx.set_fonts(fonts);
+}
+
 // Scroll source flags for the ScrollArea (disable drag-to-scroll).
 use eframe::egui::containers::scroll_area::ScrollSource;
 
@@ -91,6 +122,10 @@ struct LogViewerApp {
     // Controlled via Tools → Font submenu. Only applied when the
     // style override is set at the start of each frame.
     font_size: f32,
+
+    // Set to true once the emoji font has been loaded into the egui context.
+    // Prevents redundant font-atlas rebuilds on every frame.
+    emoji_font_loaded: bool,
 }
 
 impl LogViewerApp {
@@ -129,6 +164,7 @@ impl LogViewerApp {
             _watcher: None,
             follow_toggled: false,
             font_size: 14.0,
+            emoji_font_loaded: false,
         }
     }
 
@@ -240,6 +276,12 @@ impl eframe::App for LogViewerApp {
             egui::Color32::WHITE
         };
         let frame = egui::Frame::new().fill(frame_fill);
+
+        // Register an emoji font so Unicode emoji in log files render correctly.
+        if !self.emoji_font_loaded {
+            load_emoji_font(ui.ctx());
+            self.emoji_font_loaded = true;
+        }
 
         // Update the window title to show the currently loaded file (or just the app name).
         let title = if let Some(ref path) = self.file_path {
