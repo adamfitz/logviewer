@@ -1307,6 +1307,17 @@ impl eframe::App for LogViewerApp {
     }
 }
 
+fn load_image_from_memory(bytes: &[u8]) -> Option<Arc<egui::IconData>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(Arc::new(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    }))
+}
+
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = env::args().collect();
     let file_path = if args.len() > 1 {
@@ -1315,8 +1326,14 @@ fn main() -> Result<(), eframe::Error> {
         None
     };
 
+    let icon = load_image_from_memory(include_bytes!("../assets/icon.png"));
+
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]);
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        viewport,
         ..Default::default()
     };
 
