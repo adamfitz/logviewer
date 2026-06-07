@@ -498,11 +498,11 @@ impl eframe::App for LogViewerApp {
 
         let title = if let Some(ref path) = self.file_path {
             format!(
-                "Log Viewer - {}",
+                "rlv - {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             )
         } else {
-            "Log Viewer".to_string()
+            "rlv".to_string()
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -1122,7 +1122,7 @@ impl eframe::App for LogViewerApp {
                     ui.add_space(top_padding);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            egui::RichText::new("Welcome to Log Viewer")
+                            egui::RichText::new("Welcome to rlv")
                                 .size(28.0)
                                 .color(normal_color)
                                 .monospace(),
@@ -1321,7 +1321,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Log Viewer",
+        "rlv",
         options,
         Box::new(|_cc| Ok(Box::new(LogViewerApp::new(file_path)))),
     )

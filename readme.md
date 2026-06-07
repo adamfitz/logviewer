@@ -1,4 +1,4 @@
-# Log Viewer
+# rlv — Rust Log Viewer
 
 A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be launched independently or as a child process with an optional log file path.
 
@@ -30,9 +30,9 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 ## Usage
 
 ```
-logviewer                         # start empty, use File > Open
-logviewer /var/log/syslog         # open a file directly
-logviewer logfile.gz              # open a compressed file (.gz / .tar.gz)
+rlv                               # start empty, use File > Open
+rlv /var/log/syslog               # open a file directly
+rlv logfile.gz                    # open a compressed file (.gz / .tar.gz)
 ```
 
 ### Keybinds

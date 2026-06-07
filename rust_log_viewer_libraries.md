@@ -1,4 +1,4 @@
-# Rust Log Viewer — Library Recommendations
+# rlv — Library Recommendations
 
 ## Why `eframe`/`egui` over GTK/GIO
 
@@ -19,7 +19,7 @@ The Rust log viewer is a **standalone binary** launched as a child process from 
 
 **From the Go/Fyne side:**
 ```go
-cmd := exec.Command("/path/to/logviewer", "--file", selectedLogPath)
+cmd := exec.Command("/path/to/rlv", "--file", selectedLogPath)
 cmd.Start() // fire and forget — completely independent process
 ```
 
