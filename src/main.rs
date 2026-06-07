@@ -127,6 +127,14 @@ struct LogViewerApp {
 
     // Pre-compiled regex for the current search, reused across frames.
     search_regex: Option<fancy_regex::Regex>,
+
+    // True when reverse search is active (? in terminal mode).
+    // Reverses match cycling direction for n/N and Enter/Shift+Enter.
+    reverse_search: bool,
+
+    // Set when a reverse search is submitted; consumed on search completion
+    // to jump to the last match instead of the first.
+    pending_reverse_jump: bool,
 }
 
 fn is_compressed(path: &PathBuf) -> bool {
@@ -164,6 +172,8 @@ impl LogViewerApp {
             search_cursor: 0,
             search_regex: None,
             search_error: None,
+            reverse_search: false,
+            pending_reverse_jump: false,
         };
         if let Some(ref path) = file_path {
             app.load_file(path);
@@ -278,6 +288,8 @@ impl LogViewerApp {
         self.search_running = false;
         self.search_cursor = 0;
         self.search_regex = None;
+        self.pending_reverse_jump = false;
+        self.reverse_search = false;
     }
 
     fn start_following(&mut self) {
@@ -483,14 +495,11 @@ impl eframe::App for LogViewerApp {
                         self.search_running = false;
                         self.search_cursor = 0;
                         self.search_regex = None;
+                        self.pending_reverse_jump = false;
+                        self.reverse_search = false;
                     }
                 }
             }
-        }
-
-        // Advance the incremental search by one batch per frame.
-        if self.search_running {
-            self.advance_search();
         }
 
         if self.open_requested {
@@ -619,8 +628,12 @@ impl eframe::App for LogViewerApp {
                     egui::TextEdit::singleline(&mut self.search_query)
                         .font(egui::FontId::monospace(18.0))
                         .hint_text(
-                            egui::RichText::new("type search and press Enter")
-                                .font(egui::FontId::monospace(18.0)),
+                            egui::RichText::new(if self.reverse_search {
+                                "reverse: type search and press Enter"
+                            } else {
+                                "type search and press Enter"
+                            })
+                            .font(egui::FontId::monospace(18.0)),
                         ),
                 );
                 let label = if self.keybind_state.enabled {
@@ -651,6 +664,22 @@ impl eframe::App for LogViewerApp {
 
             ui.separator();
 
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+            // Advance the incremental search by one batch per frame.
+            if self.search_running {
+                let was_running = self.search_running;
+                self.advance_search();
+                if was_running && !self.search_running && self.pending_reverse_jump {
+                    if !self.search_matches.is_empty() {
+                        self.current_match = self.search_matches.len() - 1;
+                        let (fi, _, _) = self.search_matches[self.current_match];
+                        self.scroll_offset = fi as f32 * row_height;
+                    }
+                    self.pending_reverse_jump = false;
+                }
+            }
+
             let search_text_response = search_response.inner;
             let search_has_focus = search_text_response.has_focus();
 
@@ -671,8 +700,6 @@ impl eframe::App for LogViewerApp {
                 }
             }
 
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-
             // Enter / Shift+Enter: submit new query or cycle through matches.
             // TextEdit::singleline surrenders focus on Enter, so we check the
             // Enter key globally (not guarded by search_has_focus) so that
@@ -691,15 +718,34 @@ impl eframe::App for LogViewerApp {
                     self.current_match = 0;
                     self.search_just_submitted = true;
                     self.scroll_offset = 0.0;
+                    if self.reverse_search && self.active_search_query.len() > 0 {
+                        self.pending_reverse_jump = true;
+                    }
                 } else if search_has_focus && !self.search_matches.is_empty() {
-                    if shift {
-                        self.current_match = if self.current_match == 0 {
-                            self.search_matches.len() - 1
+                    if self.reverse_search {
+                        // Reverse mode: Enter goes backward, Shift+Enter goes forward
+                        if shift {
+                            self.current_match =
+                                (self.current_match + 1) % self.search_matches.len();
                         } else {
-                            self.current_match - 1
-                        };
+                            self.current_match = if self.current_match == 0 {
+                                self.search_matches.len() - 1
+                            } else {
+                                self.current_match - 1
+                            };
+                        }
                     } else {
-                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                        // Normal mode: Enter goes forward, Shift+Enter goes backward
+                        if shift {
+                            self.current_match = if self.current_match == 0 {
+                                self.search_matches.len() - 1
+                            } else {
+                                self.current_match - 1
+                            };
+                        } else {
+                            self.current_match =
+                                (self.current_match + 1) % self.search_matches.len();
+                        }
                     }
                     let (fi, _, _) = self.search_matches[self.current_match];
                     self.scroll_offset = fi as f32 * row_height;
@@ -722,6 +768,8 @@ impl eframe::App for LogViewerApp {
             let mut next_match = false;
             let mut prev_match = false;
             let mut follow_toggled = false;
+            let mut go_to_top = false;
+            let mut go_to_bottom = false;
             let should_quit = keybinds::process_keybinds(
                 ui.ctx(),
                 &mut self.keybind_state,
@@ -734,21 +782,47 @@ impl eframe::App for LogViewerApp {
                 &mut prev_match,
                 &mut self.open_requested,
                 &mut follow_toggled,
+                &mut self.reverse_search,
+                &mut go_to_top,
+                &mut go_to_bottom,
             );
 
-            if next_match && !self.search_matches.is_empty() {
-                self.current_match = (self.current_match + 1) % self.search_matches.len();
-                let (fi, _, _) = self.search_matches[self.current_match];
-                self.scroll_offset = fi as f32 * row_height;
-            }
-            if prev_match && !self.search_matches.is_empty() {
-                self.current_match = if self.current_match == 0 {
-                    self.search_matches.len() - 1
+            if !self.search_matches.is_empty() {
+                if go_to_top {
+                    self.current_match = 0;
+                } else if go_to_bottom {
+                    self.current_match = self.search_matches.len() - 1;
+                } else if self.reverse_search {
+                    // Reverse mode: n goes backward, N goes forward
+                    if next_match {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    }
+                    if prev_match {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
                 } else {
-                    self.current_match - 1
-                };
-                let (fi, _, _) = self.search_matches[self.current_match];
-                self.scroll_offset = fi as f32 * row_height;
+                    // Normal mode: n goes forward, N goes backward
+                    if next_match {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
+                    if prev_match {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    }
+                }
+                // Don't overwrite scroll_offset for g/G — the keybinds handler
+                // already set it to f32::MIN (top) or total_rows * row_height (bottom).
+                if !go_to_top && !go_to_bottom {
+                    let (fi, _, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
+                }
             }
 
             self.follow_toggled = self.follow_toggled || follow_toggled;

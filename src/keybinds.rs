@@ -57,6 +57,12 @@ impl KeybindState {
 //                          main.rs reads this after the call and opens the file dialog.
 //   follow_toggled       — set to true when the user presses t (toggle follow mode).
 //                          main.rs reads this after the call and toggles tail -f.
+//   reverse_search       — set to false on /, set to true on ?.
+//                          main.rs uses this to swap match cycling direction.
+//   go_to_top            — set to true when g is pressed (jump to first result).
+//                          main.rs updates current_match accordingly.
+//   go_to_bottom         — set to true when G is pressed (jump to last result).
+//                          main.rs updates current_match accordingly.
 //
 // Returns true if the application should quit (q was pressed), false otherwise.
 // main.rs checks this return value and calls frame.close() accordingly.
@@ -72,6 +78,9 @@ pub fn process_keybinds(
     prev_match_requested: &mut bool,
     open_requested: &mut bool,
     follow_toggled: &mut bool,
+    reverse_search: &mut bool,
+    go_to_top: &mut bool,
+    go_to_bottom: &mut bool,
 ) -> bool {
     // If keybind mode is not enabled, do nothing and return early.
     // This is important — we must not intercept keypresses when the user
@@ -99,11 +108,18 @@ pub fn process_keybinds(
             *scroll_delta = -LINE_SCROLL_SPEED;
         }
 
-        // --- /: search mode ---
-        // Focus the search input when terminal mode is active and the user hits '/'.
-        // The GUI search box is always visible, but in terminal mode / should
-        // jump keyboard focus into it so the user can type the search pattern.
-        if input.key_pressed(egui::Key::Slash) {
+        // --- /: forward search mode ---
+        // Focus the search input and set forward (normal) search direction.
+        if input.key_pressed(egui::Key::Slash) && !input.modifiers.shift {
+            *reverse_search = false;
+            *search_focus_requested = true;
+        }
+
+        // --- ?: reverse search mode ---
+        // Focus the search input and set reverse search direction.
+        // n/N match cycling is swapped accordingly.
+        if input.key_pressed(egui::Key::Slash) && input.modifiers.shift {
+            *reverse_search = true;
             *search_focus_requested = true;
         }
 
@@ -122,24 +138,23 @@ pub fn process_keybinds(
             *scroll_delta = -viewport_height;
         }
 
-        // --- g: jump to top ---
+        // --- g: jump to top / first match ---
         // Sets scroll to the most negative possible value; egui clamps it to 0
-        // (the top of the content) automatically.
+        // (the top of the content) automatically. Also signals main.rs to
+        // update current_match to the first search result.
         if input.key_pressed(egui::Key::G) && !input.modifiers.shift {
-            // f32::NEG_INFINITY would work but f32::MIN is more explicit about intent.
-            // egui's scroll clamping will bring this to exactly 0.0 (top of content).
             *scroll_delta = f32::MIN;
+            *go_to_top = true;
         }
 
-        // --- G (shift+g): jump to bottom ---
+        // --- G (shift+g): jump to bottom / last match ---
         // Sets scroll to the largest possible value; egui clamps it to the maximum
         // scroll position (total content height minus viewport height) automatically.
         // We check input.modifiers.shift to distinguish g from G.
+        // Also signals main.rs to update current_match to the last search result.
         if input.key_pressed(egui::Key::G) && input.modifiers.shift {
-            // total_rows * row_height gives the total content height in pixels.
-            // Requesting this as a scroll offset guarantees we land at the bottom
-            // after egui's clamping, regardless of actual viewport height.
             *scroll_delta = (total_rows as f32) * row_height;
+            *go_to_bottom = true;
         }
 
         // --- o: open file ---

@@ -10,6 +10,7 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 - **PCRE-compatible regex search** — Search patterns are treated as regular expressions (via `fancy-regex`). Supports lookahead/lookbehind, alternation, character classes, etc. Invalid patterns show an error message; "No matches found" shown when no lines match.
 - **Enter-to-submit search** — Typing does nothing until Enter is pressed. First Enter submits the query; subsequent Enters cycle through matches.
 - **Incremental batched search** — Searches over 100,000 lines per frame in the background so the UI stays responsive. A "Searching... XX%" progress indicator is shown while the search runs.
+- **Reverse search (terminal mode)** — Press `?` to search backwards; match cycling with `n`/`N`, Enter, and Shift+Enter is reversed. The initial match lands on the last result instead of the first.
 - **Search match cycling** — Forward/backward navigation through matches:
   - **GUI mode:** Enter / Shift+Enter (search focused), Ctrl+Down / Ctrl+Up (anywhere)
   - **Terminal mode:** `n` / `N` (when search is not focused), Enter / Shift+Enter (search focused)
@@ -27,8 +28,7 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 ### Planned / Not Yet Implemented
 
 | Feature | Dependencies | Notes |
-|---|---|---|
-| **Reverse search** | — | `?` keybind in terminal mode for backward search |
+|---|---|---|---|
 | **Text selection + clipboard copy** | `arboard` | Ctrl+C to copy selected text to system clipboard |
 
 ## Usage
@@ -65,7 +65,8 @@ Toggle on via the **"Mode: Terminal (vim/less)"** button in the top bar.
 | `b` | Anywhere | Page up |
 | `g` | Anywhere | Jump to top |
 | `G` (Shift+g) | Anywhere | Jump to bottom |
-| `/` | Anywhere | Focus search box |
+| `/` | Anywhere | Focus search box (forward) |
+| `?` | Anywhere | Focus search box (reverse) |
 | `o` | Anywhere | Open file |
 | `t` | Anywhere | Toggle follow (tail -f) |
 | `q` | Anywhere | Quit |
