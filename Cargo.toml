@@ -14,8 +14,14 @@ notify = "8"
 # Regex — PCRE-compatible
 fancy-regex = "0.14"
 
+# Fast byte-level substring search (SIMD-accelerated)
+memchr = "2"
+
 # Memory-mapped file streaming
 memmap2 = "0.9"
+
+# Temp files for decompressed content
+tempfile = "3"
 
 # .tar.gz support
 flate2 = "1"

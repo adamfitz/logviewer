@@ -1,36 +1,41 @@
-// Declare the keybinds module — tells the Rust compiler to look for
-// src/keybinds.rs and compile it as part of this crate.
 mod keybinds;
 
-// Import the egui immediate-mode GUI library via eframe's re-export.
-// eframe is the application framework (handles the window, event loop, OS integration).
-// egui is the GUI library itself (widgets, layout, rendering).
 use eframe::egui;
-
-// Standard library imports for CLI argument parsing, file I/O, and path handling.
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 
-// bring KeybindState into scope so we can use it without the module prefix.
 use keybinds::KeybindState;
-
-// Native file dialog for the Open menu action.
+use notify::{self, EventKind, RecursiveMode, Watcher};
 use rfd;
 
-// File system watcher for tail -f (follow mode).
-use notify::{self, EventKind, RecursiveMode, Watcher};
+// Compute byte offsets for each line in the byte slice.
+// Trailing newline does NOT add an extra empty line.
+fn compute_line_offsets(content: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut pos = 0;
+    while pos <= content.len() {
+        match memchr::memchr(b'\n', &content[pos..]) {
+            Some(nl) => {
+                offsets.push(pos);
+                pos += nl + 1;
+            }
+            None => {
+                if pos < content.len() {
+                    offsets.push(pos);
+                }
+                break;
+            }
+        }
+    }
+    offsets
+}
 
-// ── Bundled fonts ───────────────────────────────────────────────────────────
-// DejaVu Sans Mono (Bitstream Vera-derived, ~336 KB) replaces Hack as the
-// primary monospace font because it has vastly better Unicode coverage
-// (including U+2713 CHECK MARK and many other symbols that log files commonly
-// contain).  Noto Emoji Regular (~409 KB) is registered as a further fallback
-// so that actual emoji codepoints resolve to glyphs instead of tofu.
 fn load_emoji_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let dejavu: &'static [u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
@@ -56,108 +61,80 @@ fn load_emoji_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-// Scroll source flags for the ScrollArea (disable drag-to-scroll).
 use eframe::egui::containers::scroll_area::ScrollSource;
 
-// The application state struct. In egui's immediate-mode model, this struct is
-// the single source of truth — everything the UI needs to render a frame lives here.
-// Each frame, egui calls ui() and re-draws the entire interface from this state.
 struct LogViewerApp {
-    // Log file stored as individual lines rather than one large String.
-    // This is required for virtual/lazy row rendering via show_rows() —
-    // egui needs a total row count upfront and must be able to index into
-    // individual rows. Storing as Vec<String> gives us both of those for free.
-    //
-    // Performance rationale: with one big String, egui lays out every character
-    // on every resize. With Vec<String> + show_rows(), only the ~30 visible lines
-    // are laid out per frame regardless of file size, eliminating the maximise freeze.
-    lines: Vec<String>,
-    //
-    // Owned instance of the keybind runtime state (enabled/disabled flag etc.).
-    // Stored here so it persists across frames — egui re-calls ui() every frame
-    // but the struct itself lives for the lifetime of the application.
+    // Memory-mapped file content (either the original file or a decompressed temp).
+    // None when no file is loaded.
+    mmap: Option<memmap2::Mmap>,
+
+    // Byte offset of each line's start within the mmap.
+    // Offsets point to the first byte of each line (right after a newline, or 0).
+    line_offsets: Vec<usize>,
+
+    // Cached line count (line_offsets.len()).
+    total_lines: usize,
+
+    // Keeps the decompressed temp file alive while the mmap references it.
+    // Dropped when a new file is loaded, which deletes the temp file on disk.
+    // On Linux the mmap remains valid even after deletion, but keeping the
+    // temp alive prevents surprises on other platforms.
+    _temp_file: Option<tempfile::NamedTempFile>,
+
+    // Error message to display instead of file content (e.g. decompression failure).
+    error_message: Option<String>,
+
     keybind_state: KeybindState,
-
-    // The current search query entered by the user.
-    // We render this as a visible text box so typed characters are shown.
     search_query: String,
-
-    // When terminal search is requested with '/', focus the search field.
     search_focus_requested: bool,
-
-    // The scroll offset to apply this frame, in pixels.
-    // process_keybinds() writes into this each frame; the ScrollArea reads it.
-    // Reset to 0.0 each frame after being consumed so movements don't accumulate.
     scroll_offset: f32,
-
-    // Index into search_matches for the match to jump to on the next Enter press.
     current_match: usize,
-
-    // The path of the currently loaded file, if any.
-    // None means no file is loaded (app started without a CLI argument).
     file_path: Option<PathBuf>,
-
-    // Set to true by keybinds (Ctrl+O in GUI mode, o in terminal mode)
-    // to signal that a file dialog should be opened on the next frame.
     open_requested: bool,
-
-    // Whether "tail -f" follow mode is active. When true, the file is
-    // watched for changes and lines are reloaded on each modification.
     following: bool,
-
-    // Thread-safe flag set by the file watcher callback when the file
-    // has been modified. Checked once per frame in ui().
     file_changed: Arc<AtomicBool>,
-
-    // The active file watcher. Kept alive for the duration of follow mode.
-    // Dropped (set to None) when follow mode is turned off.
     _watcher: Option<notify::RecommendedWatcher>,
-
-    // Set to true by the Tools menu or keybind (Ctrl+W / t) to toggle
-    // follow mode on the next frame. Checked at the top of ui() before
-    // any borrows of self.lines are active.
     follow_toggled: bool,
-
-    // Monospace font size for the main canvas (log lines).
-    // Controlled via Tools → Font submenu. Only applied when the
-    // style override is set at the start of each frame.
     font_size: f32,
-
-    // Set to true once the emoji font has been loaded into the egui context.
-    // Prevents redundant font-atlas rebuilds on every frame.
     emoji_font_loaded: bool,
+    from_compressed: bool,
+
+    // Cached search results: indices into line_offsets of matching lines.
+    // Non-empty only when search_query is non-empty.
+    search_results: Vec<usize>,
+
+    // Cached match positions for highlighting.
+    // Each entry is (result_index, byte_offset_within_line).
+    search_matches: Vec<(usize, usize)>,
+
+    // The submitted search query (Enter pressed). Only this query triggers
+    // search — typing in the search box alone does nothing until Enter.
+    active_search_query: String,
+
+    // True on the frame after search is submitted, so the scroll area
+    // resets to the top of the filtered results.
+    search_just_submitted: bool,
+}
+
+fn is_compressed(path: &PathBuf) -> bool {
+    let s = path.to_string_lossy();
+    s.ends_with(".tar.gz") || s.ends_with(".gz")
 }
 
 impl LogViewerApp {
-    // Associated constructor function (not a trait method).
-    // Called once at startup to create the initial application state.
-    // Takes an optional PathBuf — if None, the app starts with no file loaded.
     fn new(file_path: Option<PathBuf>) -> Self {
-        // If a path was provided, attempt to load the file; otherwise start empty.
-        let (lines, stored_path) = if let Some(ref path) = file_path {
-            let content = fs::read_to_string(path).unwrap_or_else(|err| {
-                format!(
-                    "Failed to open log file: {}\nError: {}",
-                    path.display(),
-                    err
-                )
-            });
-            (
-                content.lines().map(|l| l.to_string()).collect(),
-                Some(path.clone()),
-            )
-        } else {
-            (Vec::new(), None)
-        };
-
-        Self {
-            lines,
+        let mut app = Self {
+            mmap: None,
+            line_offsets: Vec::new(),
+            total_lines: 0,
+            _temp_file: None,
+            error_message: None,
             keybind_state: KeybindState::new(),
             search_query: String::new(),
             search_focus_requested: false,
             scroll_offset: 0.0,
             current_match: 0,
-            file_path: stored_path,
+            file_path: None,
             open_requested: false,
             following: false,
             file_changed: Arc::new(AtomicBool::new(false)),
@@ -165,36 +142,129 @@ impl LogViewerApp {
             follow_toggled: false,
             font_size: 14.0,
             emoji_font_loaded: false,
+            from_compressed: false,
+            search_results: Vec::new(),
+            search_matches: Vec::new(),
+            active_search_query: String::new(),
+            search_just_submitted: false,
+        };
+        if let Some(ref path) = file_path {
+            app.load_file(path);
         }
+        app
     }
 
-    // Load a file into the viewer, replacing the current content.
+    // Memory-map an uncompressed file.
+    fn mmap_file(path: &PathBuf) -> Result<memmap2::Mmap, String> {
+        let file = fs::File::open(path)
+            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+        unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("Failed to memory-map {}: {}", path.display(), e))
+    }
+
+    // Decompress a .gz to a temp file and return the mmap + optional temp handle.
+    fn mmap_gz(path: &PathBuf) -> Result<(memmap2::Mmap, Option<tempfile::NamedTempFile>), String> {
+        let file = fs::File::open(path)
+            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut temp = tempfile::NamedTempFile::new()
+            .map_err(|_| "Failed to create temp file for decompression".to_string())?;
+        std::io::copy(&mut decoder, temp.as_file_mut())
+            .map_err(|e| format!("Failed to decompress {}: {}", path.display(), e))?;
+        temp.flush().unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(temp.as_file()) }
+            .map_err(|e| format!("Failed to memory-map decompressed file: {}", e))?;
+        Ok((mmap, Some(temp)))
+    }
+
+    // Decompress a .tar.gz to a temp file and return the mmap + optional temp handle.
+    // Extracts the first entry in the archive.
+    fn mmap_tar_gz(
+        path: &PathBuf,
+    ) -> Result<(memmap2::Mmap, Option<tempfile::NamedTempFile>), String> {
+        let file = fs::File::open(path)
+            .map_err(|e| format!("Failed to open archive: {}\nError: {}", path.display(), e))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let mut temp =
+            tempfile::NamedTempFile::new().map_err(|_| "Failed to create temp file".to_string())?;
+        let entries = archive
+            .entries()
+            .map_err(|_| "Failed to read archive entries".to_string())?;
+        let mut extracted = false;
+        for result in entries {
+            let mut entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !extracted {
+                std::io::copy(&mut entry, temp.as_file_mut())
+                    .map_err(|_| "Failed to extract archive entry".to_string())?;
+                temp.flush().unwrap();
+                extracted = true;
+                break;
+            }
+        }
+        if !extracted {
+            return Err("Archive is empty".to_string());
+        }
+        let mmap = unsafe { memmap2::Mmap::map(temp.as_file()) }
+            .map_err(|e| format!("Failed to memory-map decompressed file: {}", e))?;
+        Ok((mmap, Some(temp)))
+    }
+
     fn load_file(&mut self, path: &PathBuf) {
         self.stop_following();
-        let content = fs::read_to_string(path).unwrap_or_else(|err| {
-            format!(
-                "Failed to open log file: {}\nError: {}",
-                path.display(),
-                err
-            )
-        });
-        self.lines = content.lines().map(|l| l.to_string()).collect();
-        self.file_path = Some(path.clone());
-        self.search_query.clear();
-        self.current_match = 0;
-        self.scroll_offset = 0.0;
-    }
 
-    // Start watching the current file for changes (tail -f).
-    // Does nothing if no file is loaded or if already following.
-    fn start_following(&mut self) {
-        if self.following || self.file_path.is_none() {
-            return;
+        // Clear previous state.
+        self.mmap = None;
+        self._temp_file = None;
+        self.line_offsets.clear();
+        self.search_results.clear();
+        self.search_matches.clear();
+        self.active_search_query.clear();
+        self.error_message = None;
+
+        let compressed = is_compressed(path);
+        self.from_compressed = compressed;
+
+        let result = if compressed {
+            if path.to_string_lossy().ends_with(".tar.gz") {
+                Self::mmap_tar_gz(path)
+            } else {
+                Self::mmap_gz(path)
+            }
+        } else {
+            Self::mmap_file(path).map(|m| (m, None))
+        };
+
+        match result {
+            Ok((mmap, temp_file)) => {
+                self.line_offsets = compute_line_offsets(&mmap);
+                self.total_lines = self.line_offsets.len();
+                self.mmap = Some(mmap);
+                self._temp_file = temp_file;
+                self.file_path = Some(path.clone());
+            }
+            Err(err) => {
+                self.error_message = Some(err);
+                self.file_path = Some(path.clone());
+            }
         }
 
+        self.search_query.clear();
+        self.active_search_query.clear();
+        self.current_match = 0;
+        self.scroll_offset = 0.0;
+        self.search_just_submitted = false;
+    }
+
+    fn start_following(&mut self) {
+        if self.following || self.file_path.is_none() || self.from_compressed {
+            return;
+        }
         let path = self.file_path.as_ref().unwrap().clone();
         let changed = self.file_changed.clone();
-
         let mut watcher =
             match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
@@ -206,37 +276,63 @@ impl LogViewerApp {
                 Ok(w) => w,
                 Err(_) => return,
             };
-
         if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
             self._watcher = Some(watcher);
             self.following = true;
         }
     }
 
-    // Stop watching the current file. Does nothing if not following.
     fn stop_following(&mut self) {
         self._watcher = None;
         self.following = false;
     }
+
+    // Rebuild cached search results by scanning the mmap with memchr.
+    fn rebuild_search(&mut self) {
+        self.search_results.clear();
+        self.search_matches.clear();
+        self.current_match = 0;
+
+        let query = self.active_search_query.as_bytes();
+        if query.is_empty() || self.mmap.is_none() {
+            return;
+        }
+
+        let mmap = self.mmap.as_ref().unwrap();
+        let finder = memchr::memmem::Finder::new(query);
+        let mut fi = 0usize;
+
+        for (&start, line_idx) in self.line_offsets.iter().zip(0..) {
+            let end = if line_idx + 1 < self.total_lines {
+                // Exclude the newline byte
+                self.line_offsets[line_idx + 1] - 1
+            } else {
+                // Last line: exclude trailing newline if present
+                let raw_end = mmap.len();
+                if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
+                    raw_end - 1
+                } else {
+                    raw_end
+                }
+            };
+            let line = &mmap[start..end];
+
+            if finder.find(line).is_some() {
+                self.search_results.push(line_idx);
+
+                let mut search_pos = 0;
+                while let Some(rel_pos) = finder.find(&line[search_pos..]) {
+                    self.search_matches.push((fi, search_pos + rel_pos));
+                    search_pos += rel_pos + query.len();
+                }
+                fi += 1;
+            }
+        }
+    }
 }
 
-// Implement the eframe::App trait for our state struct.
-// This is the contract between our application logic and the eframe framework.
-// eframe will call ui() on every frame (typically 60fps or on input events).
 impl eframe::App for LogViewerApp {
-    // ui() is the core render+update method introduced in eframe 0.34.
-    // It replaces the older update(ctx, frame) signature.
-    //
-    // Parameters:
-    //   ui    — a mutable reference to the current frame's UI context.
-    //           This is what you use to add widgets (labels, buttons, scroll areas, etc.).
-    //           In 0.34+, eframe provides this directly — no need to create a CentralPanel.
-    //   frame — gives access to the eframe window itself (resize, close, set title, etc.).
-    //           Prefixed with _ to suppress the "unused variable" compiler warning.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Choose the app-wide theme based on mode.
-        // GUI mode uses a white background and black text.
-        // Terminal mode uses a black background and white text.
         let mut visuals = if self.keybind_state.enabled {
             egui::Visuals::dark()
         } else {
@@ -260,16 +356,11 @@ impl eframe::App for LogViewerApp {
         ui.ctx().set_visuals(visuals.clone());
         ui.style_mut().visuals = visuals;
 
-        // Override the monospace text style to respect the user's font size
-        // choice. This affects the main canvas (log lines); the search box
-        // and menu bar use their own explicit sizes.
         ui.style_mut().text_styles.insert(
             egui::TextStyle::Monospace,
             egui::FontId::monospace(self.font_size),
         );
 
-        // Render the mode-specific background for the entire app.
-        // GUI mode uses an all-white background; terminal mode uses all-black.
         let frame_fill = if self.keybind_state.enabled {
             egui::Color32::BLACK
         } else {
@@ -277,13 +368,11 @@ impl eframe::App for LogViewerApp {
         };
         let frame = egui::Frame::new().fill(frame_fill);
 
-        // Register an emoji font so Unicode emoji in log files render correctly.
         if !self.emoji_font_loaded {
             load_emoji_font(ui.ctx());
             self.emoji_font_loaded = true;
         }
 
-        // Update the window title to show the currently loaded file (or just the app name).
         let title = if let Some(ref path) = self.file_path {
             format!(
                 "Log Viewer - {}",
@@ -295,7 +384,7 @@ impl eframe::App for LogViewerApp {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
 
-        // GUI-mode keybinds: Ctrl+Q to quit, Ctrl+O to open, Ctrl+W to follow.
+        // GUI-mode keybinds
         if !self.keybind_state.enabled {
             if ui.input(|i| i.key_pressed(egui::Key::Q) && i.modifiers.ctrl) {
                 std::process::exit(0);
@@ -308,10 +397,9 @@ impl eframe::App for LogViewerApp {
             }
         }
 
-        // Handle deferred follow toggle (from GUI keybinds, Tools menu, or terminal t).
         if self.follow_toggled {
             self.follow_toggled = false;
-            if self.file_path.is_some() {
+            if self.file_path.is_some() && !self.from_compressed {
                 if self.following {
                     self.stop_following();
                 } else {
@@ -320,28 +408,32 @@ impl eframe::App for LogViewerApp {
             }
         }
 
-        // If following, check whether the file has changed and reload if so.
+        // Follow-mode file reload: re-mmap the file and recompute lines.
         if self.following && self.file_changed.swap(false, Ordering::Relaxed) {
             if let Some(ref path) = self.file_path.clone() {
-                let content = fs::read_to_string(path).unwrap_or_else(|err| {
-                    format!(
-                        "Failed to open log file: {}\nError: {}",
-                        path.display(),
-                        err
-                    )
-                });
-                self.lines = content.lines().map(|l| l.to_string()).collect();
+                if let Ok(file) = fs::File::open(path) {
+                    if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                        self.line_offsets = compute_line_offsets(&mmap);
+                        self.total_lines = self.line_offsets.len();
+                        self.mmap = Some(mmap);
+                        self.search_query.clear();
+                        self.active_search_query.clear();
+                        self.search_results.clear();
+                        self.search_matches.clear();
+                        self.search_just_submitted = false;
+                    }
+                }
             }
         }
 
-        // If a file open was requested (from menu, Ctrl+O, or terminal o key),
-        // show the native file dialog on this frame.
         if self.open_requested {
             self.open_requested = false;
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter(
-                    "Log files",
-                    &["log", "txt", "out", "err", "stdout", "stderr"],
+                    "Log files (*.log, *.txt, *.gz, *.tar.gz)",
+                    &[
+                        "log", "txt", "out", "err", "stdout", "stderr", "gz", "tar.gz",
+                    ],
                 )
                 .pick_file()
             {
@@ -352,9 +444,6 @@ impl eframe::App for LogViewerApp {
         frame.show(ui, |ui| {
             // --- Menu bar ---
             egui::MenuBar::new().ui(ui, |ui| {
-                // menu_item is a helper closure that renders one entry in a menu
-                // dropdown. It draws a label on the left and a shortcut hint on the
-                // right, and calls action when clicked.
                 let menu_item =
                     |ui: &mut egui::Ui,
                      label: &str,
@@ -443,19 +532,8 @@ impl eframe::App for LogViewerApp {
             });
 
             // --- Header bar ---
-            // A compact horizontal strip containing the search label, search input,
-            // and mode toggle button. All elements share a consistent height so they
-            // appear visually uniform regardless of mode.
             let search_response = ui.horizontal(|ui| {
-                // Set a minimum row height so the label, text field, and button all
-                // occupy the same vertical space and are aligned consistently.
                 ui.set_min_height(32.0);
-
-                // "Search:" label styled to visually match the mode button container
-                // (same frame fill, corner radius, and inner margins) but without
-                // button interactivity — it is a static label that signals the
-                // search field.  The label takes its natural width so the remaining
-                // header space can be split between the search box and the button.
                 let btn_v = &ui.visuals().widgets.inactive;
                 egui::Frame::default()
                     .fill(btn_v.weak_bg_fill)
@@ -466,10 +544,6 @@ impl eframe::App for LogViewerApp {
                         ui.set_min_height(32.0);
                         ui.label(egui::RichText::new("Search:").size(16.0));
                     });
-
-                // Search box: use whatever space remains after the label and the
-                // mode button (180 px) so the input always stretches to fill the
-                // header without overflowing.
                 let button_width = 180.0;
                 let gap = ui.spacing().item_spacing.x;
                 let search_width = (ui.available_width() - button_width - gap * 2.0).max(100.0);
@@ -482,10 +556,6 @@ impl eframe::App for LogViewerApp {
                                 .font(egui::FontId::monospace(18.0)),
                         ),
                 );
-
-                // Mode toggle button positioned at the right edge via a
-                // right-to-left sub-layout so it always sits consistently
-                // at the far right of the header bar.
                 let label = if self.keybind_state.enabled {
                     "Mode: Terminal (vim/less)"
                 } else {
@@ -509,11 +579,9 @@ impl eframe::App for LogViewerApp {
                         );
                     }
                 });
-
                 response
             });
 
-            // Visual separator between the header bar and the log content below.
             ui.separator();
 
             let search_text_response = search_response.inner;
@@ -522,8 +590,6 @@ impl eframe::App for LogViewerApp {
             if self.search_focus_requested {
                 search_text_response.request_focus();
                 self.search_focus_requested = false;
-
-                // Select all existing text
                 if let Some(mut state) =
                     egui::TextEdit::load_state(ui.ctx(), search_text_response.id)
                 {
@@ -538,80 +604,54 @@ impl eframe::App for LogViewerApp {
                 }
             }
 
-            // Measure the pixel height of a single monospace text row at the current
-            // UI scale factor. This must match the text style used inside show_rows()
-            // below — if they differ, row positions will be miscalculated and lines
-            // will overlap or have gaps between them.
-            // text_style_height() accounts for the font size AND the current display
-            // scale (e.g. HiDPI/Retina), so it is always correct regardless of monitor.
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
 
-            // Total number of rows in the file. show_rows() needs this to:
-            //   1. correctly size the scrollbar thumb relative to total content
-            //   2. calculate which row indices are visible at the current scroll position
-            let filtered_lines: Vec<(usize, &String)> = if self.search_query.is_empty() {
-                self.lines.iter().enumerate().collect()
-            } else {
-                self.lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains(&self.search_query))
-                    .collect()
-            };
-            let total_rows = filtered_lines.len();
-
-            // Build all match positions for Enter-based cycling through results.
-            // Each entry is (filtered_line_index, byte_offset_of_match).
-            let mut search_matches: Vec<(usize, usize)> = Vec::new();
-            if !self.search_query.is_empty() {
-                for (fi, (_, line)) in filtered_lines.iter().enumerate() {
-                    let mut start = 0;
-                    while let Some(pos) = line[start..].find(&self.search_query) {
-                        let abs_pos = start + pos;
-                        search_matches.push((fi, abs_pos));
-                        start = abs_pos + self.search_query.len();
+            // Enter / Shift+Enter: submit new query or cycle through matches.
+            // TextEdit::singleline surrenders focus on Enter, so we check the
+            // Enter key globally (not guarded by search_has_focus) so that
+            // submission works. Cycling still requires focus.
+            let (enter, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+            if enter {
+                let new_query = self.search_query != self.active_search_query;
+                if new_query {
+                    self.active_search_query = self.search_query.clone();
+                    if self.active_search_query.is_empty() {
+                        self.search_results.clear();
+                        self.search_matches.clear();
+                    } else if self.mmap.is_some() {
+                        self.rebuild_search();
                     }
+                    self.current_match = 0;
+                    self.search_just_submitted = true;
+                    self.scroll_offset = 0.0;
+                } else if search_has_focus && !self.search_matches.is_empty() {
+                    if shift {
+                        self.current_match = if self.current_match == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.current_match - 1
+                        };
+                    } else {
+                        self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    }
+                    let (fi, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
                 }
             }
-            // Clamp current_match whenever the match set changes.
-            if self.current_match >= search_matches.len() {
+
+            // Compute these AFTER the Enter handler so clearing the search
+            // (which empties search_results / search_matches) is reflected.
+            let has_query = !self.active_search_query.is_empty();
+            let total_rows = if has_query {
+                self.search_results.len()
+            } else {
+                self.total_lines
+            };
+            if self.current_match >= self.search_matches.len() {
                 self.current_match = 0;
             }
 
-            // Enter / Shift+Enter: cycle forward/backward through matches.
-            // Works in both GUI and terminal modes when the search field is focused.
-            // Enter advances to the next match; Shift+Enter goes back to the previous
-            // one. The match we jump to becomes the highlighted current match
-            // (the brighter background), so the user always sees which match is active.
-            if search_has_focus && !search_matches.is_empty() {
-                let (enter, shift) =
-                    ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
-                if enter && !shift {
-                    // Advance to the next match (wrapping around to 0 at the end).
-                    // We increment first, then scroll — this means the match we
-                    // land on IS the highlighted one, not the next one in line.
-                    self.current_match = (self.current_match + 1) % search_matches.len();
-                    let (line_idx, _) = search_matches[self.current_match];
-                    self.scroll_offset = line_idx as f32 * row_height;
-                } else if enter && shift {
-                    // Go back to the previous match (wrapping to the end at 0).
-                    // Decrement first, then scroll — same logic as forward cycling
-                    // but in reverse so the jumped-to match is highlighted.
-                    self.current_match = if self.current_match == 0 {
-                        search_matches.len() - 1
-                    } else {
-                        self.current_match - 1
-                    };
-                    let (line_idx, _) = search_matches[self.current_match];
-                    self.scroll_offset = line_idx as f32 * row_height;
-                }
-            }
-
-            // Process keybinds for this frame BEFORE rendering the ScrollArea.
-            // This ensures scroll_offset is populated before the ScrollArea reads it,
-            // so movements take effect on the same frame they are pressed (no 1-frame lag).
-            //
-            // process_keybinds() returns true if q was pressed and we should quit.
+            // Terminal keybinds
             let mut next_match = false;
             let mut prev_match = false;
             let mut follow_toggled = false;
@@ -629,26 +669,19 @@ impl eframe::App for LogViewerApp {
                 &mut follow_toggled,
             );
 
-            // Handle n/N from terminal-mode keybinds.
-            // These flags are set by process_keybinds() above when the user presses
-            // n (next match) or N / Shift+n (previous match) in terminal mode.
-            // They only fire when search is NOT focused (so the letters aren't typed
-            // into the search box). The logic mirrors Enter/Shift+Enter above:
-            // we flip current_match first, then scroll, so the jumped-to match
-            // gets the bright "current match" highlight.
-            if next_match && !search_matches.is_empty() {
-                self.current_match = (self.current_match + 1) % search_matches.len();
-                let (line_idx, _) = search_matches[self.current_match];
-                self.scroll_offset = line_idx as f32 * row_height;
+            if next_match && !self.search_matches.is_empty() {
+                self.current_match = (self.current_match + 1) % self.search_matches.len();
+                let (fi, _) = self.search_matches[self.current_match];
+                self.scroll_offset = fi as f32 * row_height;
             }
-            if prev_match && !search_matches.is_empty() {
+            if prev_match && !self.search_matches.is_empty() {
                 self.current_match = if self.current_match == 0 {
-                    search_matches.len() - 1
+                    self.search_matches.len() - 1
                 } else {
                     self.current_match - 1
                 };
-                let (line_idx, _) = search_matches[self.current_match];
-                self.scroll_offset = line_idx as f32 * row_height;
+                let (fi, _) = self.search_matches[self.current_match];
+                self.scroll_offset = fi as f32 * row_height;
             }
 
             self.follow_toggled = self.follow_toggled || follow_toggled;
@@ -657,19 +690,13 @@ impl eframe::App for LogViewerApp {
                 std::process::exit(0);
             }
 
-            // Ctrl+F in GUI mode: focus the search bar (same as / in terminal mode).
             if !self.keybind_state.enabled
                 && ui.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.ctrl)
             {
                 self.search_focus_requested = true;
             }
 
-            // Ctrl+Down / Ctrl+Up in GUI mode: cycle forward/backward through matches
-            // without needing the search field to be focused. This provides a keyboard
-            // shortcut that matches common GUI convention (many editors/text fields use
-            // Ctrl+Down/Ctrl+Up for similar navigation). The match we jump to is always
-            // the one with the bright "current match" highlight.
-            if !self.keybind_state.enabled && !search_matches.is_empty() {
+            if !self.keybind_state.enabled && !self.search_matches.is_empty() {
                 let (down, up) = ui.input(|i| {
                     (
                         i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl,
@@ -677,47 +704,33 @@ impl eframe::App for LogViewerApp {
                     )
                 });
                 if down {
-                    self.current_match = (self.current_match + 1) % search_matches.len();
-                    let (line_idx, _) = search_matches[self.current_match];
-                    self.scroll_offset = line_idx as f32 * row_height;
+                    self.current_match = (self.current_match + 1) % self.search_matches.len();
+                    let (fi, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
                 }
                 if up {
                     self.current_match = if self.current_match == 0 {
-                        search_matches.len() - 1
+                        self.search_matches.len() - 1
                     } else {
                         self.current_match - 1
                     };
-                    let (line_idx, _) = search_matches[self.current_match];
-                    self.scroll_offset = line_idx as f32 * row_height;
+                    let (fi, _) = self.search_matches[self.current_match];
+                    self.scroll_offset = fi as f32 * row_height;
                 }
             }
 
-            // Apply the scroll delta computed by process_keybinds() this frame.
-            // vertical_scroll_offset() sets an absolute position; we add the delta
-            // to whatever the current position is to get relative movement.
-            // After consuming it, reset to 0.0 so the view does not keep scrolling
-            // on frames where no key is pressed.
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             let mut scroll_area = egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .stick_to_bottom(self.following)
                 .scroll_source(ScrollSource::SCROLL_BAR | ScrollSource::MOUSE_WHEEL);
-            if self.scroll_offset != 0.0 {
-                // scroll_to_row would be cleaner for g/G but vertical_scroll_offset
-                // is simpler and works correctly for all movements including page up/down.
+            if self.scroll_offset != 0.0 || self.search_just_submitted {
                 scroll_area = scroll_area.vertical_scroll_offset(self.scroll_offset);
-                // Reset after consuming so movement stops when the key is released.
                 self.scroll_offset = 0.0;
+                self.search_just_submitted = false;
             }
 
-            // Pre-compute text formats for search highlighting.
-            // Three tiers of visual treatment:
-            //   1. normal_fmt  — plain text, no match
-            //   2. match_fmt   — a search match that is NOT the current one (subtle bg)
-            //   3. current_fmt — the active/current match (bright bg + high-contrast fg)
-            // The current match uses black text on a vivid gold background so it
-            // "pops" visually against the regular match highlights and is easy to
-            // spot even in large log files.
+            // Pre-compute text formats for search highlighting
             let is_terminal = self.keybind_state.enabled;
             let monospace_font = ui
                 .style()
@@ -758,9 +771,11 @@ impl eframe::App for LogViewerApp {
                 ..Default::default()
             };
 
-            if self.lines.is_empty() && self.file_path.is_none() {
-                // Empty state — fill the entire available area with the
-                // correct background colour and centre the welcome text.
+            // --- Main content area ---
+            let has_content = self.mmap.is_some() || self.error_message.is_some();
+
+            if !has_content && self.file_path.is_none() {
+                // Welcome screen
                 let fill_rect = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
@@ -783,102 +798,151 @@ impl eframe::App for LogViewerApp {
                         );
                     });
                 });
-            } else {
-                let query = &self.search_query;
-                scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                    let range = row_range.clone();
-                    for (rel_fi, &(index, line)) in filtered_lines[range].iter().enumerate() {
-                        let fi = row_range.start + rel_fi;
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                egui::vec2(72.0, row_height),
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{:>6}", index + 1)).monospace(),
-                                ),
-                            );
-                            if query.is_empty() {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(line).monospace()).wrap(),
-                                );
-                            } else {
-                                let mut job = egui::text::LayoutJob::default();
-                                let mut start = 0;
-                                while let Some(pos) = line[start..].find(query) {
-                                    let abs_pos = start + pos;
-                                    if abs_pos > start {
-                                        job.append(&line[start..abs_pos], 0.0, normal_fmt.clone());
-                                    }
-                                    let is_current = search_matches
-                                        .get(self.current_match)
-                                        .map(|&(cm_fi, cm_off)| cm_fi == fi && cm_off == abs_pos)
-                                        .unwrap_or(false);
-                                    let fmt = if is_current { &current_fmt } else { &match_fmt };
-                                    job.append(
-                                        &line[abs_pos..abs_pos + query.len()],
-                                        0.0,
-                                        fmt.clone(),
-                                    );
-                                    start = abs_pos + query.len();
-                                }
-                                if start < line.len() {
-                                    job.append(&line[start..], 0.0, normal_fmt.clone());
-                                }
-                                ui.add(egui::Label::new(job).wrap());
-                            }
-                        });
-                    }
+            } else if let Some(ref err) = self.error_message.clone() {
+                // Error state
+                let fill_rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                    let content_height = 60.0;
+                    let top_padding = ((fill_rect.height() - content_height) / 2.0).max(0.0);
+                    ui.add_space(top_padding);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Error loading file")
+                                .size(20.0)
+                                .color(egui::Color32::RED)
+                                .monospace(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .size(14.0)
+                                .color(normal_color)
+                                .monospace(),
+                        );
+                    });
                 });
+            } else {
+                // Normal log file rendering
+                let mmap = self.mmap.as_ref().unwrap();
+                let line_offsets = &self.line_offsets;
+                let total_lines = self.total_lines;
+                let search_results = &self.search_results;
+                let search_matches = &self.search_matches;
+                let active_query = self.active_search_query.clone();
+
+                if has_query && total_rows == 0 {
+                    let fill_rect = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(fill_rect, 0.0, frame_fill);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(fill_rect), |ui| {
+                        let top_padding = ((fill_rect.height() - 30.0) / 2.0).max(0.0);
+                        ui.add_space(top_padding);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("No matches found")
+                                    .size(18.0)
+                                    .color(normal_color)
+                                    .monospace(),
+                            );
+                        });
+                    });
+                } else {
+                    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+                        for abs_fi in row_range {
+                            let line_idx = if has_query {
+                                search_results[abs_fi]
+                            } else {
+                                abs_fi
+                            };
+
+                            let start = line_offsets[line_idx];
+                            let end = if line_idx + 1 < total_lines {
+                                line_offsets[line_idx + 1] - 1
+                            } else {
+                                let raw_end = mmap.len();
+                                if raw_end > 0 && mmap[raw_end - 1] == b'\n' {
+                                    raw_end - 1
+                                } else {
+                                    raw_end
+                                }
+                            };
+
+                            let line_bytes = &mmap[start..end];
+                            let line = String::from_utf8_lossy(line_bytes);
+
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    egui::vec2(72.0, row_height),
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{:>6}", line_idx + 1))
+                                            .monospace(),
+                                    ),
+                                );
+                                if active_query.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line.as_ref()).monospace(),
+                                        )
+                                        .wrap(),
+                                    );
+                                } else {
+                                    let mut job = egui::text::LayoutJob::default();
+                                    let line_str = line.as_ref();
+                                    let mut start = 0;
+                                    while let Some(pos) = line_str[start..].find(&active_query) {
+                                        let abs_pos = start + pos;
+                                        if abs_pos > start {
+                                            job.append(
+                                                &line_str[start..abs_pos],
+                                                0.0,
+                                                normal_fmt.clone(),
+                                            );
+                                        }
+                                        let is_current = search_matches
+                                            .get(self.current_match)
+                                            .map(|&(cm_fi, cm_off)| {
+                                                cm_fi == abs_fi && cm_off == abs_pos
+                                            })
+                                            .unwrap_or(false);
+                                        let fmt =
+                                            if is_current { &current_fmt } else { &match_fmt };
+                                        job.append(
+                                            &line_str[abs_pos..abs_pos + active_query.len()],
+                                            0.0,
+                                            fmt.clone(),
+                                        );
+                                        start = abs_pos + active_query.len();
+                                    }
+                                    if start < line_str.len() {
+                                        job.append(&line_str[start..], 0.0, normal_fmt.clone());
+                                    }
+                                    ui.add(egui::Label::new(job).wrap());
+                                }
+                            });
+                        }
+                    });
+                }
             }
         });
     }
 }
 
-// main() is the program entry point.
-// It returns Result<(), eframe::Error> so that eframe startup failures
-// (e.g. no display server, GPU init failure) propagate cleanly rather than panicking.
 fn main() -> Result<(), eframe::Error> {
-    // Collect all command-line arguments into a Vec<String>.
-    // args[0] is always the binary name itself (e.g. "./logviewer").
-    // args[1] onwards are the user-supplied arguments.
     let args: Vec<String> = env::args().collect();
-
-    // The file path argument is optional — if provided, open it directly;
-    // otherwise start with an empty viewer and let the user open a file
-    // via the File menu or Ctrl+O.
     let file_path = if args.len() > 1 {
         Some(PathBuf::from(&args[1]))
     } else {
         None
     };
 
-    // Configure the native window options before creating it.
-    // NativeOptions wraps everything eframe needs to initialise the OS window.
     let options = eframe::NativeOptions {
-        // ViewportBuilder is a builder pattern for window properties.
-        // with_inner_size sets the initial inner dimensions in logical pixels
-        // (logical = physical pixels divided by the display scale factor,
-        // so this looks the same size on both standard and HiDPI/Retina screens).
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
-
-        // ..Default::default() fills all other NativeOptions fields with their
-        // defaults — vsync on, no fullscreen, system-native decorations, etc.
         ..Default::default()
     };
 
-    // Start the eframe event loop. This call blocks until the window is closed.
-    //
-    // Arguments:
-    //   "Log Viewer"  — the window title shown in the OS title bar / taskbar.
-    //   options       — the window configuration built above.
-    //   Box::new(...) — a heap-allocated closure that constructs our app state.
-    //                   eframe calls this closure once during initialisation.
-    //                   _cc is the CreationContext (fonts, render state, storage) — unused here.
-    //                   Returns Ok(Box<dyn App>) as required by the eframe API.
     eframe::run_native(
         "Log Viewer",
         options,
         Box::new(|_cc| Ok(Box::new(LogViewerApp::new(file_path)))),
     )
-    // run_native returns Result<(), eframe::Error>, which we propagate directly
-    // to main's return type via the implicit return (no semicolon).
 }
