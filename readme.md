@@ -7,9 +7,9 @@ A standalone text file log viewer built with Rust and `eframe`/`egui`. Can be la
 - **GUI framework** — Cross-platform native window via `eframe` + `egui` (immediate-mode, zero runtime deps)
 - **Memory-mapped file I/O** — Files are memory-mapped (not read into `Vec<String>`); only visible lines are extracted on demand. Line offsets stored as a compact `Vec<usize>` (~8 bytes per line). No full-file allocation.
 - **Virtual scrolling** — Only visible lines are rendered per frame via `egui::ScrollArea::show_rows()`, handling large files smoothly
-- **SIMD-accelerated search** — Uses `memchr` for byte-level substring search. Search results are cached and only rebuilt on Enter (no incremental/live search).
-- **PCRE-compatible regex search** — Search patterns are treated as regular expressions (via `fancy-regex`). Supports lookahead/lookbehind, alternation, character classes, etc.
-- **Enter-to-submit search** — Typing does nothing until Enter is pressed. First Enter submits the query; subsequent Enters cycle through matches. Invalid regex patterns show an error message; "No matches found" shown when no lines match.
+- **PCRE-compatible regex search** — Search patterns are treated as regular expressions (via `fancy-regex`). Supports lookahead/lookbehind, alternation, character classes, etc. Invalid patterns show an error message; "No matches found" shown when no lines match.
+- **Enter-to-submit search** — Typing does nothing until Enter is pressed. First Enter submits the query; subsequent Enters cycle through matches.
+- **Incremental batched search** — Searches over 100,000 lines per frame in the background so the UI stays responsive. A "Searching... XX%" progress indicator is shown while the search runs.
 - **Search match cycling** — Forward/backward navigation through matches:
   - **GUI mode:** Enter / Shift+Enter (search focused), Ctrl+Down / Ctrl+Up (anywhere)
   - **Terminal mode:** `n` / `N` (when search is not focused), Enter / Shift+Enter (search focused)
