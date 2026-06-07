@@ -1887,10 +1887,12 @@ dependencies = [
  "egui",
  "fancy-regex",
  "flate2",
+ "memchr",
  "memmap2",
  "notify",
  "rfd",
  "tar",
+ "tempfile",
 ]
 
 [[package]]
